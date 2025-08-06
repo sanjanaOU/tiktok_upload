@@ -10,10 +10,10 @@ CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
 CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
 
-# TikTok domain verification route
-@app.route("/tiktokdvfNYX2K11qZunpO3MBI04o1RWhOo5Xq.txt")
+# TikTok domain verification route (updated signature)
+@app.route("/tiktok9dVrxhEzi3zcH36RaNj2Pc9VFhNvQkGE.txt")
 def verify_file():
-    return "tiktok-developers-site-verification=dvfNYX2K11qZunpO3MBI04o1RWhOo5Xq", 200, {'Content-Type': 'text/plain'}
+    return "tiktok-developers-site-verification=9dVrxhEzi3zcH36RaNj2Pc9VFhNvQkGE", 200, {'Content-Type': 'text/plain'}
 
 # Home page
 @app.route('/')
