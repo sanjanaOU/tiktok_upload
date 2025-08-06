@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: tiktok-automation
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: TIKTOK_CLIENT_KEY
+        value: YOUR_CLIENT_KEY
+      - key: TIKTOK_CLIENT_SECRET
+        value: YOUR_SECRET
+      - key: REDIRECT_URI
+        value: YOUR_CALLBACK
+      - key: FLASK_SECRET_KEY
+        value: ANY_SECRET
