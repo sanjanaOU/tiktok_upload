@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Upload Result</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:Inter,system-ui,Segoe UI,Arial; background:#0b0b0b; color:#eaeaea; display:flex; min-height:100vh; align-items:center; justify-content:center;}
+    .card{width: 95%; max-width: 700px; background:#111; border:1px solid #222; border-radius:16px; padding:24px; box-shadow:0 6px 30px rgba(0,0,0,.4)}
+    .ok{color:#4ade80} .bad{color:#f87171}
+    pre{white-space:pre-wrap; background:#0e0e0e; border:1px solid #242424; padding:14px; border-radius:10px; overflow:auto; max-height:60vh}
+    a {color:#fff}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 class="{{ 'ok' if ok else 'bad' }}">{{ 'Success 🎉' if ok else 'Error' }}</h2>
+    <pre>{{ message | tojson(indent=2) if message is mapping else message }}</pre>
+    <p><a href="/">Back</a></p>
+  </div>
+</body>
+</html>
