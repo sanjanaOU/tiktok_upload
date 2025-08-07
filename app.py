@@ -1,115 +1,146 @@
-from flask import Flask, redirect, request, session, jsonify
 import os
-import requests
+import secrets
 from urllib.parse import urlencode
+from flask import Flask, redirect, request, session, jsonify
+
+import requests
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret")
 
-# === TikTok OAuth config ===
-CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
-CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
+# ====== ENV ======
+# .env (or Render "Environment") MUST contain these, exactly:
+# TIKTOK_CLIENT_KEY=sbawemm7fb4n0ps8iz           <-- your sandbox client key
+# TIKTOK_CLIENT_SECRET=uF1lxNnTU20eDtoqojsfQe75HA5Jvn4g
+# REDIRECT_URI=https://tiktok-upload.onrender.com/callback
+# FLASK_SECRET_KEY=<any random string>
 
-# You said you want to use this one:
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://tiktok-upload.onrender.com/callback")
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
+
+CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
+CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
+
+# *** This must be IDENTICAL everywhere (portal, authorize, token exchange) ***
+REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
 
 AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 
-# Scopes you enabled (Login Kit + Content Posting)
 SCOPES = "user.info.basic,video.upload,video.publish"
 
 
-@app.route("/healthz")
-def healthz():
-    return "ok", 200
+# ---------- helpers ----------
+def new_state():
+    s = secrets.token_urlsafe(24)
+    session["oauth_state"] = s
+    return s
 
 
+# ---------- routes ----------
 @app.route("/")
 def index():
     return (
-        "<h3>TikTok OAuth Demo</h3>"
-        "<p><a href='/login'>Login with TikTok</a></p>"
-        "<p><a href='/debug-auth'>Debug authorize URL</a></p>"
+        "<h3>TikTok OAuth</h3>"
+        '<p><a href="/login">Login with TikTok</a></p>'
+        '<p><a href="/debug-auth">/debug-auth</a> (shows values the server is using)</p>'
     )
-
-
-@app.route("/login")
-def login():
-    # Build the authorize URL
-    params = {
-        "client_key": CLIENT_KEY,
-        "response_type": "code",
-        "scope": SCOPES,
-        "redirect_uri": REDIRECT_URI,   # must match portal exactly
-        "state": "state123",
-    }
-    return redirect(f"{AUTH_URL}?{urlencode(params)}")
 
 
 @app.route("/debug-auth")
 def debug_auth():
+    data = {
+        "client_key": CLIENT_KEY,
+        "redirect_uri_from_env": REDIRECT_URI,
+        "scopes": SCOPES,
+        "session_state": session.get("oauth_state"),
+    }
+    # Show the exact authorize URL we will send the user to
     params = {
         "client_key": CLIENT_KEY,
         "response_type": "code",
         "scope": SCOPES,
         "redirect_uri": REDIRECT_URI,
-        "state": "state123",
+        "state": session.get("oauth_state") or "(none yet)",
     }
-    url = f"{AUTH_URL}?{urlencode(params)}"
-    html = [
-        "<h3>Authorize URL (copy this entire line)</h3>",
-        f"<pre>{url}</pre>",
-        "<p>Now click <a href='/login'>/login</a> to use the same URL.</p>",
-        "<p><b>IMPORTANT:</b> This redirect_uri must be byte-for-byte identical to the one in your TikTok portal:</p>",
-        f"<pre>{REDIRECT_URI}</pre>",
-    ]
-    return "\n".join(html)
+    data["authorize_url"] = AUTH_URL + "?" + urlencode(params)
+    return jsonify(data)
+
+
+@app.route("/login")
+def login():
+    # Always generate a fresh state to avoid reusing codes tied to older redirects
+    state = new_state()
+
+    params = {
+        "client_key": CLIENT_KEY,
+        "response_type": "code",
+        "scope": SCOPES,
+        "redirect_uri": REDIRECT_URI,   # <-- EXACT SAME STRING
+        "state": state,
+        # "force_verify": "1",  # optional: forces TikTok to re-prompt
+    }
+    url = AUTH_URL + "?" + urlencode(params)
+    return redirect(url, code=302)
 
 
 @app.route("/callback")
 def callback():
-    # TikTok sends you back here
+    # TikTok returns ?code=...&state=...
     err = request.args.get("error")
     if err:
-        return f"Error from TikTok: {err}", 400
+        return f"❌ TikTok error: {err}", 400
 
     code = request.args.get("code")
-    if not code:
-        return "Authorization failed: no 'code' in query.", 400
+    state = request.args.get("state")
 
-    # Exchange code for access token
+    if not code:
+        return "❌ Missing ?code from TikTok.", 400
+
+    # Optional: check state
+    saved_state = session.get("oauth_state")
+    if not saved_state or saved_state != state:
+        return "❌ State mismatch. Start login again.", 400
+
+    # --- Exchange authorization code for access token ---
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    data = {
+    payload = {
         "client_key": CLIENT_KEY,
         "client_secret": CLIENT_SECRET,
         "code": code,
         "grant_type": "authorization_code",
-        "redirect_uri": REDIRECT_URI,  # must match exactly
+        # *** MUST MATCH *** the value used in /login and the app portal
+        "redirect_uri": REDIRECT_URI,
     }
-    r = requests.post(TOKEN_URL, headers=headers, data=data)
-    if r.status_code != 200:
-        return f"❌ Failed to get access token: {r.text}", 400
 
-    tok = r.json()
-    access_token = tok.get("access_token")
-    open_id = tok.get("open_id")
+    # Use urlencoded body (not JSON)
+    body = urlencode(payload)
+    r = requests.post(TOKEN_URL, headers=headers, data=body, timeout=30)
 
-    if not access_token:
-        return f"❌ Token response missing access_token: {tok}", 400
+    try:
+        token_json = r.json()
+    except Exception:
+        token_json = {"raw": r.text}
 
-    session["access_token"] = access_token
-    session["open_id"] = open_id
+    if r.status_code != 200 or "access_token" not in token_json:
+        return (
+            "❌ Token response missing access_token: "
+            + jsonify(token_json).get_data(as_text=True),
+            400,
+        )
 
-    # Simple success page
-    masked = access_token[:6] + "..." + access_token[-4:]
+    # success
+    session["access_token"] = token_json["access_token"]
+    session["open_id"] = token_json.get("open_id")
     return (
-        f"<p>✅ Access token acquired.</p>"
-        f"<p>Open ID: {open_id}</p>"
-        f"<p>Access token (masked): {masked}</p>"
-        f"<p><a href='/'>Home</a></p>"
+        f"✅ Got token for open_id={session.get('open_id')}<br>"
+        f"<pre>{token_json}</pre>"
     )
 
 
+@app.route("/health")
+def health():
+    return "ok", 200
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+    # Local dev: python app.py
+    app.run(host="0.0.0.0", port=5051, debug=True)
