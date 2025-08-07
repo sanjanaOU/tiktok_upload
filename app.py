@@ -1,16 +1,19 @@
 from flask import Flask, request, redirect, session, render_template, jsonify
+from flask_cors import CORS
 import requests
 import os
+import urllib.parse
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY")
+CORS(app)  # Enable CORS for frontend integration
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "your_fallback_secret")
 
 # Load TikTok credentials from environment
 CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
 CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
 
-# TikTok domain verification route (updated signature)
+# TikTok domain verification file
 @app.route("/tiktok9dVrxhEzi3zcH36RaNj2Pc9VFhNvQkGE.txt")
 def verify_file():
     return "tiktok-developers-site-verification=9dVrxhEzi3zcH36RaNj2Pc9VFhNvQkGE", 200, {'Content-Type': 'text/plain'}
@@ -20,24 +23,25 @@ def verify_file():
 def index():
     return render_template('index.html')
 
-# Redirect to TikTok login
+# TikTok login route
 @app.route('/login')
 def login():
+    scope = urllib.parse.quote_plus("user.info.basic,video.list,video.upload")
     return redirect(
         f"https://www.tiktok.com/v2/auth/authorize/"
         f"?client_key={CLIENT_KEY}"
-        f"&scope=user.info.basic,video.list,video.upload"
+        f"&scope={scope}"
         f"&response_type=code"
         f"&redirect_uri={REDIRECT_URI}"
-        f"&state=your_custom_state"
+        f"&state=secure_random_state"
     )
 
-# Callback route for TikTok OAuth
+# TikTok callback route
 @app.route('/callback')
 def callback():
     code = request.args.get('code')
     if not code:
-        return 'Authorization failed', 400
+        return 'Authorization failed. No code received.', 400
 
     token_url = 'https://open.tiktokapis.com/v2/oauth/token/'
     data = {
@@ -50,7 +54,7 @@ def callback():
 
     response = requests.post(token_url, data=data)
     if response.status_code != 200:
-        return 'Failed to get access token', 400
+        return f"Failed to get access token: {response.text}", 400
 
     token_data = response.json()
     session['access_token'] = token_data['access_token']
@@ -58,14 +62,17 @@ def callback():
 
     return redirect('/upload')
 
-# Upload a video by URL
+# Upload video page and endpoint
 @app.route('/upload', methods=['GET', 'POST'])
 def upload():
     if request.method == 'POST':
         access_token = session.get('access_token')
         open_id = session.get('open_id')
-        video_url = request.form.get('video_url')
-        caption = request.form.get('caption', 'Uploaded via Flask')
+        video_url = request.json.get('video_url')
+        caption = request.json.get('caption', 'Uploaded via Flask')
+
+        if not access_token or not open_id:
+            return jsonify({'error': 'Missing authentication'}), 401
 
         # Step 1: Create media container
         container_url = "https://open.tiktokapis.com/v2/post/publish/container/"
