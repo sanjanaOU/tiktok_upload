@@ -1,184 +1,146 @@
-from flask import Flask, render_template, request, redirect, session, url_for, jsonify
 import os
-import requests
+import secrets
 from urllib.parse import urlencode
+from flask import Flask, redirect, request, session, jsonify
 
-# ====== CONFIG ======
-# Set these via environment variables in Render (.env) or locally:
-# TIKTOK_CLIENT_KEY=...
-# TIKTOK_CLIENT_SECRET=...
-# REDIRECT_URI=https://<your-service>.onrender.com/callback
-# FLASK_SECRET_KEY=any-long-random-string
-CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
-CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")
-FLASK_SECRET = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
-
-# TikTok endpoints
-AUTH_URL = "https://www.tiktok.com/v2/auth/authorize"
-TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token"
-CONTAINER_URL = "https://open.tiktokapis.com/v2/post/publish/container/"
-PUBLISH_URL = "https://open.tiktokapis.com/v2/post/publish/"
+import requests
 
 app = Flask(__name__)
-app.secret_key = FLASK_SECRET
+
+# ====== ENV ======
+# .env (or Render "Environment") MUST contain these, exactly:
+# TIKTOK_CLIENT_KEY=sbawemm7fb4n0ps8iz           <-- your sandbox client key
+# TIKTOK_CLIENT_SECRET=uF1lxNnTU20eDtoqojsfQe75HA5Jvn4g
+# REDIRECT_URI=https://tiktok-upload.onrender.com/callback
+# FLASK_SECRET_KEY=<any random string>
+
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
+
+CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
+CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
+
+# *** This must be IDENTICAL everywhere (portal, authorize, token exchange) ***
+REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
+
+AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
+TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
+
+SCOPES = "user.info.basic,video.upload,video.publish"
 
 
-# ====== VIEWS ======
+# ---------- helpers ----------
+def new_state():
+    s = secrets.token_urlsafe(24)
+    session["oauth_state"] = s
+    return s
 
+
+# ---------- routes ----------
 @app.route("/")
 def index():
-    """Simple form UI"""
-    return render_template("index.html",
-                           authed=bool(session.get("access_token")),
-                           open_id=session.get("open_id"))
+    return (
+        "<h3>TikTok OAuth</h3>"
+        '<p><a href="/login">Login with TikTok</a></p>'
+        '<p><a href="/debug-auth">/debug-auth</a> (shows values the server is using)</p>'
+    )
 
 
-@app.route("/start-upload", methods=["POST"])
-def start_upload():
-    """
-    Save form input → if not logged in, go to OAuth. If logged in, upload now.
-    """
-    video_url = request.form.get("video_url", "").strip()
-    caption = request.form.get("caption", "").strip()
-
-    if not video_url:
-        return render_template("result.html", ok=False, message="Please provide a public .mp4 URL.")
-
-    # Save the pending job in session (super simple for demo)
-    session["pending_upload"] = {"video_url": video_url, "caption": caption}
-
-    if not session.get("access_token") or not session.get("open_id"):
-        return redirect(url_for("login"))
-
-    return redirect(url_for("do_upload"))
+@app.route("/debug-auth")
+def debug_auth():
+    data = {
+        "client_key": CLIENT_KEY,
+        "redirect_uri_from_env": REDIRECT_URI,
+        "scopes": SCOPES,
+        "session_state": session.get("oauth_state"),
+    }
+    # Show the exact authorize URL we will send the user to
+    params = {
+        "client_key": CLIENT_KEY,
+        "response_type": "code",
+        "scope": SCOPES,
+        "redirect_uri": REDIRECT_URI,
+        "state": session.get("oauth_state") or "(none yet)",
+    }
+    data["authorize_url"] = AUTH_URL + "?" + urlencode(params)
+    return jsonify(data)
 
 
 @app.route("/login")
 def login():
-    """
-    Kick off TikTok OAuth with scopes required to publish.
-    """
+    # Always generate a fresh state to avoid reusing codes tied to older redirects
+    state = new_state()
+
     params = {
         "client_key": CLIENT_KEY,
         "response_type": "code",
-        "scope": "user.info.basic,video.upload,video.publish",
-        "redirect_uri": REDIRECT_URI,
-        "state": "state123",  # put a real CSRF token in production
+        "scope": SCOPES,
+        "redirect_uri": REDIRECT_URI,   # <-- EXACT SAME STRING
+        "state": state,
+        # "force_verify": "1",  # optional: forces TikTok to re-prompt
     }
-    return redirect(f"{AUTH_URL}/?{urlencode(params)}")
+    url = AUTH_URL + "?" + urlencode(params)
+    return redirect(url, code=302)
 
 
 @app.route("/callback")
 def callback():
-    """
-    TikTok redirects here. Exchange code for token.
-    If a pending upload exists, finish it automatically.
-    """
-    if request.args.get("error"):
-        return render_template("result.html", ok=False,
-                               message=f"TikTok error: {request.args.get('error')}")
+    # TikTok returns ?code=...&state=...
+    err = request.args.get("error")
+    if err:
+        return f"❌ TikTok error: {err}", 400
 
     code = request.args.get("code")
-    if not code:
-        return render_template("result.html", ok=False, message="Missing ?code from TikTok.")
+    state = request.args.get("state")
 
-    # Exchange code → access token
-    data = {
+    if not code:
+        return "❌ Missing ?code from TikTok.", 400
+
+    # Optional: check state
+    saved_state = session.get("oauth_state")
+    if not saved_state or saved_state != state:
+        return "❌ State mismatch. Start login again.", 400
+
+    # --- Exchange authorization code for access token ---
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    payload = {
         "client_key": CLIENT_KEY,
         "client_secret": CLIENT_SECRET,
         "code": code,
         "grant_type": "authorization_code",
+        # *** MUST MATCH *** the value used in /login and the app portal
         "redirect_uri": REDIRECT_URI,
     }
-    token_res = requests.post(TOKEN_URL, data=data, timeout=30)
 
-    if token_res.status_code != 200:
-        return render_template("result.html", ok=False,
-                               message=f"Token exchange failed: {token_res.text}")
+    # Use urlencoded body (not JSON)
+    body = urlencode(payload)
+    r = requests.post(TOKEN_URL, headers=headers, data=body, timeout=30)
 
-    token_json = token_res.json()
-    access_token = token_json.get("access_token")
-    open_id = token_json.get("open_id")
+    try:
+        token_json = r.json()
+    except Exception:
+        token_json = {"raw": r.text}
 
-    if not access_token or not open_id:
-        return render_template("result.html", ok=False,
-                               message=f"Token response missing fields: {token_json}")
+    if r.status_code != 200 or "access_token" not in token_json:
+        return (
+            "❌ Token response missing access_token: "
+            + jsonify(token_json).get_data(as_text=True),
+            400,
+        )
 
-    # Save to session
-    session["access_token"] = access_token
-    session["open_id"] = open_id
-
-    # If a form was submitted before auth, finish the upload
-    if session.get("pending_upload"):
-        return redirect(url_for("do_upload"))
-
-    # Otherwise just return to home
-    return redirect(url_for("index"))
-
-
-@app.route("/do-upload")
-def do_upload():
-    """
-    Create a container with video_url + caption, then publish it.
-    Requires the domain of video_url to be VERIFIED in TikTok portal (for pull_by_url).
-    """
-    access_token = session.get("access_token")
-    open_id = session.get("open_id")
-    pending = session.get("pending_upload")
-
-    if not access_token or not open_id:
-        return redirect(url_for("login"))
-
-    if not pending:
-        return render_template("result.html", ok=False, message="No video to upload. Please submit the form.")
-
-    video_url = pending["video_url"]
-    caption = pending.get("caption") or ""
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    # 1) Create container
-    container_payload = {
-        "video_url": video_url,   # must be public & on a verified domain
-        "caption": caption[:2200] # TikTok caption limit
-    }
-    c_res = requests.post(CONTAINER_URL, json=container_payload, headers=headers, timeout=60)
-    if c_res.status_code != 200:
-        return render_template("result.html", ok=False,
-                               message=f"Container error: {c_res.text}")
-
-    c_json = c_res.json()
-    container_id = (c_json.get("data") or {}).get("container_id")
-    if not container_id:
-        return render_template("result.html", ok=False,
-                               message=f"No container_id in response: {c_json}")
-
-    # 2) Publish
-    publish_payload = {
-        "open_id": open_id,
-        "container_id": container_id
-    }
-    p_res = requests.post(PUBLISH_URL, json=publish_payload, headers=headers, timeout=60)
-    # Clear pending so a refresh doesn't repost
-    session.pop("pending_upload", None)
-
-    if p_res.status_code != 200:
-        return render_template("result.html", ok=False,
-                               message=f"Publish error: {p_res.text}")
-
-    return render_template("result.html", ok=True, message=p_res.json())
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("index"))
+    # success
+    session["access_token"] = token_json["access_token"]
+    session["open_id"] = token_json.get("open_id")
+    return (
+        f"✅ Got token for open_id={session.get('open_id')}<br>"
+        f"<pre>{token_json}</pre>"
+    )
 
 
 @app.route("/health")
 def health():
     return "ok", 200
+
+
+if __name__ == "__main__":
+    # Local dev: python app.py
+    app.run(host="0.0.0.0", port=5051, debug=True)
