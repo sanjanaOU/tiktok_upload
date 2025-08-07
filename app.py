@@ -6,14 +6,12 @@ import os
 app = Flask(__name__)
 app.secret_key = 'your_secret_key_here'
 
-# TikTok App Credentials (from Developer Portal)
+# TikTok credentials from Developer Portal
 CLIENT_KEY = "sbawemm7fb4n0ps8iz"
 CLIENT_SECRET = "uF1lxNnTU20eDtoqojsfQe75HA5Jvn4g"
+REDIRECT_URI = "https://tiktok-upload.onrender.com/callback"  # Must match TikTok dashboard
 
-# Set this to match TikTok Developer Console exactly
-REDIRECT_URI = "https://tiktok-upload.onrender.com/callback"
-
-# Step 1: OAuth Login URL
+# TikTok OAuth login
 @app.route('/')
 def login():
     auth_url = "https://www.tiktok.com/v2/auth/authorize/?" + urlencode({
@@ -25,20 +23,23 @@ def login():
     })
     return redirect(auth_url)
 
-# Step 2: TikTok redirects to this after login
+# TikTok redirects here after login
 @app.route('/callback')
 def callback():
     code = request.args.get("code")
     error = request.args.get("error")
 
     if error:
-        return f"Error from TikTok: {error}"
+        return f"❌ TikTok Error: {error}"
 
     if not code:
-        return "No code received from TikTok."
+        return "❌ No code received."
 
     # Exchange code for access token
     token_url = "https://open.tiktokapis.com/v2/oauth/token"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
     data = {
         "client_key": CLIENT_KEY,
         "client_secret": CLIENT_SECRET,
@@ -47,7 +48,7 @@ def callback():
         "redirect_uri": REDIRECT_URI
     }
 
-    response = requests.post(token_url, data=data)
+    response = requests.post(token_url, data=data, headers=headers)
     if response.status_code == 200:
         token_info = response.json()
         access_token = token_info.get("access_token")
@@ -58,11 +59,10 @@ def callback():
     else:
         return f"❌ Failed to get access token: {response.text}"
 
-# Optional: Revoke session or test
 @app.route('/logout')
 def logout():
     session.clear()
-    return "Logged out."
+    return "✅ Logged out."
 
 if __name__ == '__main__':
     app.run(debug=True)
