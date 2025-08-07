@@ -5,7 +5,6 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY")
 
@@ -14,7 +13,7 @@ TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
 
 @app.route("/")
-def home():
+def index():
     return redirect("/login")
 
 @app.route("/login")
@@ -24,19 +23,19 @@ def login():
         "response_type": "code",
         "scope": "user.info.basic,video.upload",
         "redirect_uri": REDIRECT_URI,
-        "state": "secure_random_state",
+        "state": "state123"
     }
-
-    return redirect(f"https://www.tiktok.com/v2/auth/authorize/?{urlencode(params)}")
+    url = f"https://www.tiktok.com/v2/auth/authorize/?{urlencode(params)}"
+    print("➡️ Redirecting to TikTok OAuth:", url)
+    return redirect(url)
 
 @app.route("/callback")
 def callback():
     code = request.args.get("code")
     if not code:
-        return "Error: No code returned by TikTok"
-
+        return "No code received"
+    
     token_url = "https://open.tiktokapis.com/v2/oauth/token/"
-
     payload = {
         "client_key": TIKTOK_CLIENT_KEY,
         "client_secret": TIKTOK_CLIENT_SECRET,
@@ -46,14 +45,11 @@ def callback():
     }
 
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
     response = requests.post(token_url, data=payload, headers=headers)
 
     if response.status_code == 200:
-        session["access_token"] = response.json().get("access_token")
-        return "✅ TikTok access token received!"
-    else:
-        return f"❌ Token request failed:\n{response.text}"
+        return "✅ Token exchange success!"
+    return f"❌ Failed to exchange token: {response.text}"
 
 if __name__ == "__main__":
     app.run(debug=True)
