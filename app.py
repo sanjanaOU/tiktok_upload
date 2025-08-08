@@ -1,63 +1,86 @@
 import os
+import json
 import secrets
-import tempfile
 from urllib.parse import urlencode
 
 import requests
-from flask import Flask, request, session, redirect, jsonify, make_response
+from flask import (
+    Flask, request, session, redirect, jsonify, make_response, send_from_directory
+)
+from werkzeug.utils import secure_filename
 
-# ========= ENV =========
+# ------------------------------------------------------------------------------
+# ENV (set these in Render or your shell)
+# ------------------------------------------------------------------------------
 CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
 CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
 REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
-SCOPES = "user.info.basic,video.upload,video.publish"
+FLASK_SECRET = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
 
-AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
-TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
-CONTAINER_URL = "https://open.tiktokapis.com/v2/post/publish/container/"
-PUBLISH_URL = "https://open.tiktokapis.com/v2/post/publish/"
+# TikTok endpoints (v2)
+AUTH_URL       = "https://www.tiktok.com/v2/auth/authorize/"
+TOKEN_URL      = "https://open.tiktokapis.com/v2/oauth/token/"
+CONTAINER_URL  = "https://open.tiktokapis.com/v2/post/publish/container/"
+PUBLISH_URL    = "https://open.tiktokapis.com/v2/post/publish/"
+SCOPES         = "user.info.basic,video.upload,video.publish"
 
+# Flask
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
+app.secret_key = FLASK_SECRET
 
+# --- Upload limits (you can adjust these; Render/host may impose their own) ---
+# e.g., 200 MB
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v"}
 
-# ========= helpers =========
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
 def new_state():
     s = secrets.token_urlsafe(24)
     session["oauth_state"] = s
     return s
 
 def json_or_text(resp):
-    ct = resp.headers.get("content-type", "")
-    if ct.startswith("application/json"):
+    """Return (status_code, body_dict_or_text, is_json) for robust logging."""
+    ct = (resp.headers.get("content-type") or "").lower()
+    if "application/json" in ct:
         try:
             return resp.status_code, resp.json(), True
         except Exception:
             pass
     return resp.status_code, {"non_json_body": resp.text}, False
 
-def authed():
+def require_auth() -> bool:
     return bool(session.get("access_token") and session.get("open_id"))
 
-# ========= oauth =========
+def allowed_filename(filename: str) -> bool:
+    _fn = filename.lower()
+    return any(_fn.endswith(ext) for ext in ALLOWED_EXTENSIONS)
+
+# ------------------------------------------------------------------------------
+# OAuth routes
+# ------------------------------------------------------------------------------
 @app.route("/")
 def index():
-    if authed():
+    if require_auth():
         return make_response(
             f"""
             <h3>TikTok OAuth ✔</h3>
             <p>open_id: <code>{session.get('open_id')}</code></p>
-            <p><a href="/upload-url">Post a video from ANY public URL (server will re-upload)</a></p>
+            <p><a href="/upload">Publish a video from your computer</a></p>
             <p><a href="/logout">Logout</a></p>
             <p><a href="/debug-auth">/debug-auth</a></p>
-            """, 200
+            """,
+            200,
         )
     return make_response(
         """
         <h3>TikTok OAuth</h3>
         <p><a href="/login">Login with TikTok</a></p>
         <p><a href="/debug-auth">/debug-auth</a></p>
-        """, 200
+        """,
+        200,
     )
 
 @app.route("/login")
@@ -77,32 +100,34 @@ def callback():
     err = request.args.get("error")
     if err:
         return f"❌ TikTok error: {err}", 400
+
     code = request.args.get("code")
     state = request.args.get("state")
     if not code:
-        return "❌ Missing ?code", 400
+        return "❌ Missing ?code from TikTok.", 400
     if session.get("oauth_state") != state:
-        return "❌ State mismatch. Start again.", 400
+        return "❌ State mismatch. Start login again.", 400
 
-    r = requests.post(
-        TOKEN_URL,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data=urlencode({
-            "client_key": CLIENT_KEY,
-            "client_secret": CLIENT_SECRET,
-            "code": code,
-            "grant_type": "authorization_code",
-            "redirect_uri": REDIRECT_URI,
-        }),
-        timeout=30
-    )
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    payload = {
+        "client_key": CLIENT_KEY,
+        "client_secret": CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": REDIRECT_URI,  # must match exactly
+    }
+    r = requests.post(TOKEN_URL, headers=headers, data=urlencode(payload), timeout=45)
     status, body, _ = json_or_text(r)
+
     if status != 200 or "access_token" not in body:
-        return make_response(f"❌ Token exchange failed ({status}):<pre>{body}</pre>", 400)
+        return make_response(
+            f"❌ Token exchange failed ({status}):<pre>{body}</pre>",
+            400,
+        )
 
     session["access_token"] = body["access_token"]
     session["open_id"] = body.get("open_id")
-    return redirect("/upload-url")
+    return redirect("/upload")
 
 @app.route("/logout")
 def logout():
@@ -119,160 +144,134 @@ def debug_auth():
         "state": session.get("oauth_state") or "(none yet)",
     }
     return jsonify({
-        "client_key": CLIENT_KEY[:4] + "***",
+        "client_key_starts_with": CLIENT_KEY[:4] + "***",
         "redirect_uri_from_env": REDIRECT_URI,
         "authorize_url": AUTH_URL + "?" + urlencode(params),
         "has_token": bool(session.get("access_token")),
         "open_id": session.get("open_id"),
     })
 
-# ========= UI: give PUBLIC URL; backend re-uploads =========
-@app.route("/upload-url", methods=["GET"])
-def upload_url_page():
-    if not authed():
+# ------------------------------------------------------------------------------
+# UI + UPLOAD_BY_FILE flow (local file → backend → TikTok)
+# ------------------------------------------------------------------------------
+@app.route("/upload", methods=["GET"])
+def upload_page():
+    if not require_auth():
         return redirect("/login")
     return make_response(
         """
-        <h2>Post from ANY public URL (domain NOT required to be verified)</h2>
-        <p>Server will download the file first, then upload to TikTok via UPLOAD_FROM_FILE.</p>
-        <form id="f" onsubmit="return false">
-          <label>Public MP4 URL</label><br>
-          <input name="video_url" style="width:600px" placeholder="https://example.com/video.mp4" />
-          <br><br>
+        <h2>Publish to TikTok: Upload a file from your computer</h2>
+        <form id="f" enctype="multipart/form-data" onsubmit="return false">
+          <label>Select video (.mp4/.mov/.m4v)</label><br>
+          <input type="file" name="video" accept="video/*" required /><br><br>
           <label>Caption</label><br>
-          <input name="caption" style="width:600px" value="Hello from API" />
-          <br><br>
-          <button onclick="go()">Publish</button>
+          <input style="width:600px" name="caption" value="Hello from Content Posting API!"/><br><br>
+          <button onclick="doUpload()">Publish</button>
         </form>
         <pre id="out" style="white-space:pre-wrap;background:#111;color:#0f0;padding:10px;"></pre>
+
         <script>
-        async function go(){
+        async function doUpload() {
           const fd = new FormData(document.getElementById('f'));
-          const res = await fetch('/publish-from-public-url', {
+          const res = await fetch('/publish-file', {
             method: 'POST',
-            headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({
-              video_url: fd.get('video_url'),
-              caption: fd.get('caption')
-            })
+            body: fd
           });
-          const text = await res.text();
-          try { document.getElementById('out').textContent = JSON.stringify(JSON.parse(text), null, 2); }
-          catch(e){ document.getElementById('out').textContent = text; }
+          let text = await res.text();
+          try { text = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+          document.getElementById('out').textContent = text;
         }
         </script>
-        """, 200
+        """,
+        200,
     )
 
-@app.route("/publish-from-public-url", methods=["POST"])
-def publish_from_public_url():
-    if not authed():
-        return jsonify({"error":"not_authenticated"}), 401
+@app.route("/publish-file", methods=["POST"])
+def publish_file():
+    """
+    Creates a container with source=UPLOAD_BY_FILE (multipart/form-data),
+    then publishes it. No verified domain is needed for this flow.
+    """
+    if not require_auth():
+        return jsonify({"error": "not_authenticated"}), 401
 
-    data = request.get_json(silent=True) or {}
-    video_url = (data.get("video_url") or "").strip()
-    caption = (data.get("caption") or "").strip()
-    if not video_url:
-        return jsonify({"error":"video_url is required"}), 400
+    file = request.files.get("video")
+    caption = (request.form.get("caption") or "").strip()
 
-    # 1) Download the remote file to a temp path
-    try:
-        with requests.get(video_url, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            # quick validation – you can relax this if needed
-            ct = r.headers.get("content-type", "")
-            if "mp4" not in ct and not video_url.lower().endswith(".mp4"):
-                return jsonify({"error":"file must be mp4 (content-type or .mp4)"}), 400
+    if not file or file.filename == "":
+        return jsonify({"error": "No file uploaded"}), 400
 
-            # Size guard (e.g., 1 GB)
-            total = int(r.headers.get("content-length", "0") or "0")
-            if total and total > 1_000_000_000:
-                return jsonify({"error":"file too large (>1GB)"}), 400
+    if not allowed_filename(file.filename):
+        return jsonify({"error": "Unsupported file type"}), 400
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        tmp.write(chunk)
-                tmp_path = tmp.name
-    except Exception as e:
-        return jsonify({"error":"download_failed", "detail": str(e)}), 400
-
+    # 1) Create publish container (UPLOAD_BY_FILE)
     access_token = session["access_token"]
     open_id = session["open_id"]
 
-    # 2) Create container with UPLOAD_FROM_FILE
+    filename = secure_filename(file.filename)
+    mime = file.mimetype or "video/mp4"
+
+    # TikTok expects multipart/form-data with:
+    #   - files['video'] : the binary
+    #   - data['post_info'] : JSON string for meta (e.g., {"text":"..."})
+    data = {"post_info": json.dumps({"text": caption})}
+    files = {"video": (filename, file.stream, mime)}
+
+    step1_json, step2_json = {}, {}
+
     try:
-        create_payload = {
-            "source_info": { "source": "UPLOAD_FROM_FILE" },
-            "text": caption
-        }
         r1 = requests.post(
             CONTAINER_URL,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            json=create_payload,
-            timeout=60
+            headers={"Authorization": f"Bearer {access_token}"},
+            data=data,
+            files=files,
+            timeout=300,  # large timeout for bigger videos
         )
-        s1, b1, _ = json_or_text(r1)
-        if s1 != 200 or "data" not in b1 or "container_id" not in b1["data"] or "upload_url" not in b1["data"]:
-            os.unlink(tmp_path)
-            return jsonify({"step":"create_container", "status": s1, "response": b1}), 400
+        status1, body1, _ = json_or_text(r1)
+        step1_json = {"status": status1, "response": body1}
 
-        container_id = b1["data"]["container_id"]
-        upload_url = b1["data"]["upload_url"]
+        if status1 != 200 or not isinstance(body1, dict) or "data" not in body1 or "container_id" not in body1["data"]:
+            return jsonify({"step": "create_container", **step1_json}), 400
 
-        # 3) PUT the bytes to upload_url
-        size_bytes = os.path.getsize(tmp_path)
-        with open(tmp_path, "rb") as f:
-            put = requests.put(
-                upload_url,
-                data=f,
-                headers={
-                    "Content-Type": "video/mp4",
-                    "Content-Length": str(size_bytes),
-                },
-                timeout=120
-            )
-        os.unlink(tmp_path)
-        s2, b2, _ = json_or_text(put)
-        if s2 not in (200, 201, 204):  # some CDNs return 204 for successful upload
-            return jsonify({"step":"upload_file", "status": s2, "response": b2}), 400
+        container_id = body1["data"]["container_id"]
 
-        # 4) Publish container
-        r3 = requests.post(
+        # 2) Publish the container
+        r2 = requests.post(
             PUBLISH_URL,
             headers={
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
             },
             json={"open_id": open_id, "container_id": container_id},
-            timeout=60
+            timeout=60,
         )
-        s3, b3, _ = json_or_text(r3)
-        if s3 != 200:
-            return jsonify({"step":"publish", "status": s3, "response": b3, "container_id": container_id}), 400
+        status2, body2, _ = json_or_text(r2)
+        step2_json = {"status": status2, "response": body2}
+
+        if status2 != 200:
+            return jsonify({"step": "publish", "container_id": container_id, **step2_json}), 400
 
         return jsonify({
             "ok": True,
             "container_id": container_id,
-            "upload": {"status": s2, "resp": b2},
-            "publish": {"status": s3, "resp": b3}
+            "create_container": step1_json,
+            "publish": step2_json,
         }), 200
 
     except Exception as e:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "create_container": step1_json,
+            "publish": step2_json,
+        }), 500
 
-
+# ------------------------------------------------------------------------------
 @app.route("/health")
 def health():
     return "ok", 200
 
-
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
+    # Local dev
     app.run(host="0.0.0.0", port=5051, debug=True)
