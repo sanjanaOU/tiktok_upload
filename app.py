@@ -1,171 +1,104 @@
 import os
-import io
 import secrets
-import tempfile
 from urllib.parse import urlencode
 
-from flask import Flask, request, session, redirect, jsonify, render_template_string
 import requests
+from flask import (
+    Flask, request, session, redirect, jsonify, make_response
+)
 
-app = Flask(__name__)
+# ------------------------------------------------------------------------------
+# ENV VARS you must set in Render (or a .env when running locally):
+#   TIKTOK_CLIENT_KEY=sbawemm7fb4n0ps8iz
+#   TIKTOK_CLIENT_SECRET=uF1lxNnTU20eDtoqojsfQe75HA5Jvn4g
+#   REDIRECT_URI=https://tiktok-upload.onrender.com/callback
+#   FLASK_SECRET_KEY=<any random string>
+# ------------------------------------------------------------------------------
 
-# ====== ENV ======
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
 CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
 CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
 REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
 
-# ====== TikTok endpoints ======
-AUTH_URL   = "https://www.tiktok.com/v2/auth/authorize/"
-TOKEN_URL  = "https://open.tiktokapis.com/v2/oauth/token/"
-ASSET_UPLOAD_URL = "https://open.tiktokapis.com/v2/assets/upload/"           # <— CHANGED
-CONTAINER_URL    = "https://open.tiktokapis.com/v2/post/publish/container/"
-PUBLISH_URL      = "https://open.tiktokapis.com/v2/post/publish/"
-
+AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
+TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
+CONTAINER_URL = "https://open.tiktokapis.com/v2/post/publish/container/"
+PUBLISH_URL = "https://open.tiktokapis.com/v2/post/publish/"
 SCOPES = "user.info.basic,video.upload,video.publish"
 
-# ====== Download constraints ======
-MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
-ALLOWED_CONTENT_TYPES = {"video/mp4", "video/quicktime", "video/x-matroska", "video/webm"}
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
 
-# ---------- helpers ----------
+
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
 def new_state():
     s = secrets.token_urlsafe(24)
     session["oauth_state"] = s
     return s
 
-def as_json_safe(resp):
-    try:
-        return resp.json()
-    except Exception:
-        return {"non_json_body": resp.text, "status": resp.status_code}
 
-def require_login():
-    if not session.get("access_token"):
-        return redirect("/login")
-    return None
-
-def download_video_to_temp(url: str):
-    try:
-        head = requests.head(url, allow_redirects=True, timeout=15)
-    except Exception as e:
-        raise ValueError(f"HEAD request failed: {e}")
-
-    content_type = (head.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-    content_len = head.headers.get("Content-Length")
-    size = None
-    if content_len:
+def json_or_text(resp):
+    """Return (status_code, body, is_json) for robust logging"""
+    ct = resp.headers.get("content-type", "")
+    if ct.startswith("application/json"):
         try:
-            size = int(content_len)
-            if size <= 0 or size > MAX_DOWNLOAD_BYTES:
-                raise ValueError(f"File too large/zero (reported {size}). Cap={MAX_DOWNLOAD_BYTES}.")
-        except ValueError:
-            size = None
+            return resp.status_code, resp.json(), True
+        except Exception:
+            pass
+    return resp.status_code, {"non_json_body": resp.text}, False
 
-    if content_type and content_type not in ALLOWED_CONTENT_TYPES:
-        # Optional: enforce types strictly; comment out to allow anything
-        pass
 
-    try:
-        r = requests.get(url, stream=True, timeout=30)
-        r.raise_for_status()
-    except Exception as e:
-        raise ValueError(f"GET stream failed: {e}")
+def require_auth():
+    if not session.get("access_token") or not session.get("open_id"):
+        return False
+    return True
 
-    ctype_stream = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-    if ctype_stream:
-        content_type = ctype_stream
 
-    total = 0
-    suffix = ".mp4" if "mp4" in content_type else ".bin"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    try:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if not chunk:
-                continue
-            tmp.write(chunk)
-            total += len(chunk)
-            if total > MAX_DOWNLOAD_BYTES:
-                raise ValueError(f"Downloaded over limit ({total} > {MAX_DOWNLOAD_BYTES}).")
-    finally:
-        tmp.flush()
-        tmp.close()
-
-    return tmp.name, (content_type or "application/octet-stream"), total
-
-# ---------- UI ----------
-INDEX_HTML = """
-<h2>TikTok Upload (push-by-file via Assets API)</h2>
-<p>
-  <a href="/login">Login</a> |
-  <a href="/debug-auth">Debug</a> |
-  <a href="/upload">Upload by public URL</a>
-</p>
-{% if access_token %}
-  <p>✅ Logged in. open_id: {{ open_id }}</p>
-{% else %}
-  <p>❌ Not logged in.</p>
-{% endif %}
-"""
-
-UPLOAD_HTML = """
-<h3>Upload a public video URL (server downloads & uploads file to TikTok)</h3>
-{% if not access_token %}
-  <p style="color:red">Please <a href="/login">login</a> first.</p>
-{% endif %}
-<form action="/upload-by-file" method="post">
-  <div>
-    <label>Public Video URL (.mp4/.mov/.mkv/.webm)</label><br>
-    <input style="width: 520px" type="url" name="video_url" required placeholder="https://.../file.mp4" />
-  </div>
-  <div style="margin-top:8px">
-    <label>Caption</label><br>
-    <input style="width: 520px" type="text" name="caption" maxlength="2200" placeholder="My caption"/>
-  </div>
-  <div style="margin-top:12px">
-    <button type="submit">Upload & Publish</button>
-  </div>
-</form>
-"""
-
-# ---------- routes ----------
+# ------------------------------------------------------------------------------
+# OAuth routes
+# ------------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return render_template_string(
-        INDEX_HTML,
-        access_token=bool(session.get("access_token")),
-        open_id=session.get("open_id"),
-    )
+    if require_auth():
+        return make_response(
+            f"""
+            <h3>TikTok OAuth ✔</h3>
+            <p>open_id: <code>{session.get('open_id')}</code></p>
+            <p><a href="/upload">Publish a video from VERIFIED URL</a></p>
+            <p><a href="/logout">Logout</a></p>
+            <p><a href="/debug-auth">/debug-auth</a></p>
+            """, 200
+        )
+    else:
+        return make_response(
+            """
+            <h3>TikTok OAuth</h3>
+            <p><a href="/login">Login with TikTok</a></p>
+            <p><a href="/debug-auth">/debug-auth</a></p>
+            """, 200
+        )
 
-@app.route("/debug-auth")
-def debug_auth():
-    params = {
-        "client_key": CLIENT_KEY, "response_type": "code", "scope": SCOPES,
-        "redirect_uri": REDIRECT_URI, "state": session.get("oauth_state") or "(none yet)",
-    }
-    return jsonify({
-        "client_key": CLIENT_KEY,
-        "redirect_uri_from_env": REDIRECT_URI,
-        "scopes": SCOPES,
-        "session_state": session.get("oauth_state"),
-        "authorize_url": AUTH_URL + "?" + urlencode(params),
-        "have_access_token": bool(session.get("access_token")),
-        "open_id": session.get("open_id"),
-    })
 
 @app.route("/login")
 def login():
     state = new_state()
     params = {
-        "client_key": CLIENT_KEY, "response_type": "code", "scope": SCOPES,
-        "redirect_uri": REDIRECT_URI, "state": state,
+        "client_key": CLIENT_KEY,
+        "response_type": "code",
+        "scope": SCOPES,
+        "redirect_uri": REDIRECT_URI,
+        "state": state,
     }
     return redirect(AUTH_URL + "?" + urlencode(params), code=302)
 
+
 @app.route("/callback")
 def callback():
-    if request.args.get("error"):
-        return f"❌ TikTok error: {request.args['error']}", 400
+    err = request.args.get("error")
+    if err:
+        return f"❌ TikTok error: {err}", 400
+
     code = request.args.get("code")
     state = request.args.get("state")
     if not code:
@@ -173,104 +106,181 @@ def callback():
     if session.get("oauth_state") != state:
         return "❌ State mismatch. Start login again.", 400
 
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
     payload = {
-        "client_key": CLIENT_KEY, "client_secret": CLIENT_SECRET,
-        "code": code, "grant_type": "authorization_code", "redirect_uri": REDIRECT_URI,
+        "client_key": CLIENT_KEY,
+        "client_secret": CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": REDIRECT_URI,  # must match exactly
     }
-    r = requests.post(TOKEN_URL,
-                      headers={"Content-Type": "application/x-www-form-urlencoded"},
-                      data=urlencode(payload), timeout=30)
-    token_json = as_json_safe(r)
-    if r.status_code != 200 or "access_token" not in token_json:
-        return ("❌ Token exchange failed:<br><pre>" + str(token_json) + "</pre>", 400)
+    r = requests.post(TOKEN_URL, headers=headers, data=urlencode(payload), timeout=30)
+    status, body, is_json = json_or_text(r)
 
-    session["access_token"] = token_json["access_token"]
-    session["open_id"] = token_json.get("open_id")
-    return (f"✅ Logged in as open_id={session.get('open_id')}<br>"
-            f"<pre>{token_json}</pre><p><a href=\"/upload\">Go to upload form</a></p>")
+    if status != 200 or ("access_token" not in body):
+        return make_response(
+            f"❌ Token exchange failed ({status}):<pre>{body}</pre>", 400
+        )
 
+    session["access_token"] = body["access_token"]
+    session["open_id"] = body.get("open_id")
+    return redirect("/upload")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
+
+
+@app.route("/debug-auth")
+def debug_auth():
+    params = {
+        "client_key": CLIENT_KEY,
+        "response_type": "code",
+        "scope": SCOPES,
+        "redirect_uri": REDIRECT_URI,
+        "state": session.get("oauth_state") or "(none yet)",
+    }
+    return jsonify({
+        "client_key": CLIENT_KEY[:4] + "***",
+        "redirect_uri_from_env": REDIRECT_URI,
+        "authorize_url": AUTH_URL + "?" + urlencode(params),
+        "has_token": bool(session.get("access_token")),
+        "open_id": session.get("open_id"),
+    })
+
+
+# ------------------------------------------------------------------------------
+# Simple UI + publish-by-URL flow (PULL_FROM_URL)
+# ------------------------------------------------------------------------------
 @app.route("/upload", methods=["GET"])
-def upload_form():
-    return render_template_string(UPLOAD_HTML, access_token=bool(session.get("access_token")))
+def upload_page():
+    if not require_auth():
+        return redirect("/login")
+    # Simple inline form and client-side fetch to POST /publish-by-url
+    return make_response(
+        """
+        <h2>Publish to TikTok: Pull From Verified URL</h2>
+        <p><b>Important:</b> The video URL must be hosted on a domain you've verified in the TikTok Developer Portal.</p>
+        <form id="f" onsubmit="return false">
+          <label>Public video URL (.mp4) on VERIFIED domain</label><br>
+          <input style="width:600px" name="video_url" value="" placeholder="https://tiktok-upload.onrender.com/media/example.mp4"/><br><br>
+          <label>Caption</label><br>
+          <input style="width:600px" name="caption" value="Hello from API!"/><br><br>
+          <button onclick="doUpload()">Publish</button>
+        </form>
+        <pre id="out" style="white-space:pre-wrap;background:#111;color:#0f0;padding:10px;"></pre>
 
-@app.route("/upload-by-file", methods=["POST"])
-def upload_by_file():
-    if (redir := require_login()) is not None:
-        return redir
+        <script>
+        async function doUpload() {
+          const fd = new FormData(document.getElementById('f'));
+          const video_url = fd.get('video_url');
+          const caption = fd.get('caption');
 
-    access_token = session.get("access_token")
-    open_id = session.get("open_id")
-    video_url = (request.form.get("video_url") or "").strip()
-    caption = (request.form.get("caption") or "").strip()
+          const res = await fetch('/publish-by-url', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({video_url, caption})
+          });
+          const data = await res.json().catch(() => ({non_json: true, body: await res.text()}));
+          document.getElementById('out').textContent = JSON.stringify(data, null, 2);
+        }
+        </script>
+        """, 200
+    )
+
+
+@app.route("/publish-by-url", methods=["POST"])
+def publish_by_url():
+    if not require_auth():
+        return jsonify({"error": "not_authenticated"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    video_url = (payload.get("video_url") or "").strip()
+    caption = (payload.get("caption") or "").strip()
 
     if not video_url:
-        return "Missing video_url", 400
+        return jsonify({"error": "video_url is required"}), 400
 
-    # 1) Download
+    access_token = session["access_token"]
+    open_id = session["open_id"]
+
+    # ---- Step 1: Create container with PULL_FROM_URL ----
+    step1_json = {}
+    step2_json = {}
     try:
-        path, content_type, size = download_video_to_temp(video_url)
-    except ValueError as e:
-        return jsonify({"error": "download_failed", "detail": str(e)}), 400
-
-    # 2) Upload to Assets API (multipart field name MUST be "file")
-    with open(path, "rb") as f:
-        files = {"file": ("video.mp4", f, content_type or "video/mp4")}
-        up = requests.post(
-            ASSET_UPLOAD_URL,
-            headers={"Authorization": f"Bearer {access_token}"},
-            files=files,
-            timeout=300,
-        )
-    up_json = as_json_safe(up)
-    if up.status_code != 200:
-        return jsonify({"step": "asset_upload", "status": up.status_code, "response": up_json}), 400
-
-    asset_id = up_json.get("data", {}).get("asset_id") or up_json.get("asset_id")
-    if not asset_id:
-        return jsonify({"step": "asset_upload", "status": up.status_code, "response": up_json,
-                        "error": "asset_id missing"}), 400
-
-    # 3) Create container (source_info -> FILE -> video_post.asset_id)
-    c_payload = {
-        "source_info": {
-            "source": "FILE",
-            "video_post": {
-                "asset_id": asset_id,
-                "caption": caption or ""
-            }
+        create_payload = {
+            "source_info": {
+                "source": "PULL_FROM_URL",
+                "video_url": video_url,  # must be on a verified domain
+            },
+            "text": caption,
         }
-    }
-    c = requests.post(
-        CONTAINER_URL,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        json=c_payload, timeout=60,
-    )
-    c_json = as_json_safe(c)
-    if c.status_code != 200:
-        return jsonify({"step": "create_container", "status": c.status_code, "response": c_json}), 400
+        r1 = requests.post(
+            CONTAINER_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json=create_payload,
+            timeout=60,
+        )
+        status1, body1, _ = json_or_text(r1)
+        step1_json = {"status": status1, "response": body1}
 
-    container_id = c_json.get("data", {}).get("container_id") or c_json.get("container_id")
-    if not container_id:
-        return jsonify({"step": "create_container", "status": c.status_code, "response": c_json,
-                        "error": "container_id missing"}), 400
+        if status1 != 200 or not isinstance(body1, dict) or "data" not in body1 or "container_id" not in body1["data"]:
+            return jsonify({
+                "step": "create_container",
+                "status": status1,
+                "response": body1
+            }), 400
 
-    # 4) Publish
-    p_payload = {"open_id": open_id, "container_id": container_id}
-    p = requests.post(
-        PUBLISH_URL,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        json=p_payload, timeout=60,
-    )
-    p_json = as_json_safe(p)
-    if p.status_code != 200:
-        return jsonify({"step": "publish", "status": p.status_code, "response": p_json}), 400
+        container_id = body1["data"]["container_id"]
 
-    return jsonify({"ok": True, "message": "Upload + Publish succeeded",
-                    "asset_upload": up_json, "container": c_json, "publish": p_json})
+        # ---- Step 2: Publish the container ----
+        r2 = requests.post(
+            PUBLISH_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={"open_id": open_id, "container_id": container_id},
+            timeout=60,
+        )
+        status2, body2, _ = json_or_text(r2)
+        step2_json = {"status": status2, "response": body2}
 
+        if status2 != 200:
+            return jsonify({
+                "step": "publish",
+                "status": status2,
+                "response": body2,
+                "container_id": container_id
+            }), 400
+
+        return jsonify({
+            "ok": True,
+            "container_id": container_id,
+            "create_container": step1_json,
+            "publish": step2_json
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "create_container": step1_json,
+            "publish": step2_json
+        }), 500
+
+
+# ------------------------------------------------------------------------------
 @app.route("/health")
 def health():
     return "ok", 200
 
+
 if __name__ == "__main__":
+    # Local dev
     app.run(host="0.0.0.0", port=5051, debug=True)
