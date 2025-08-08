@@ -1,32 +1,29 @@
 import os, time, secrets
 from urllib.parse import urlencode
-from flask import Flask, request, redirect, session, jsonify, render_template
+from flask import Flask, redirect, request, session, jsonify, render_template
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
-CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")               # must match TikTok console exactly
+# ====== ENV ======
+CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
+CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
+REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()   # must match TikTok console exactly
 SCOPES = os.getenv("TIKTOK_SCOPES", "user.info.basic video.upload video.publish")
-FLASK_SECRET = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(16))
 
-# TikTok endpoints
+# ====== TikTok endpoints ======
 AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 DIRECT_POST_INIT = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 STATUS_FETCH = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
 
+# ====== Flask ======
 app = Flask(__name__)
-app.secret_key = FLASK_SECRET
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
 
 
-# ---- helpers ----
-def _get_tokens():
-    d = session.get("tk", {})
-    return d.get("access_token"), d.get("refresh_token"), d.get("expires_at", 0)
-
+# ---------- helpers ----------
 def _save_tokens(access_token, refresh_token, expires_in):
     session["tk"] = {
         "access_token": access_token,
@@ -34,13 +31,18 @@ def _save_tokens(access_token, refresh_token, expires_in):
         "expires_at": int(time.time()) + int(expires_in) - 60,  # refresh 60s early
     }
 
+def _get_tokens():
+    d = session.get("tk") or {}
+    return d.get("access_token"), d.get("refresh_token"), d.get("expires_at", 0)
+
 def _ensure_access_token():
     access_token, refresh_token, expires_at = _get_tokens()
     if not access_token:
         return None
     if time.time() < expires_at:
         return access_token
-    # refresh
+
+    # Refresh
     r = requests.post(
         TOKEN_URL,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -58,38 +60,38 @@ def _ensure_access_token():
     return data["access_token"]
 
 
-# ---- routes ----
+# ---------- routes ----------
 @app.route("/")
-def index():
+def home():
     access_token, *_ = _get_tokens()
     if not access_token:
-        # build auth URL
-        state = secrets.token_urlsafe(16)
-        session["state"] = state
+        # Build TikTok authorize URL
+        state = secrets.token_urlsafe(24)
+        session["oauth_state"] = state
         q = {
             "client_key": CLIENT_KEY,
             "response_type": "code",
-            "scope": SCOPES,                 # spaces will be URL-encoded
-            "redirect_uri": REDIRECT_URI,    # MUST match TikTok console exactly
+            "scope": SCOPES,              # space-delimited
+            "redirect_uri": REDIRECT_URI, # MUST match the one in TikTok console
             "state": state,
         }
-        # helpful for debugging:
-        print("AUTH:", f"{AUTH_URL}?{urlencode(q)}")
-        return redirect(f"{AUTH_URL}?{urlencode(q)}")
+        print("AUTH:", f"{AUTH_URL}?{urlencode(q)}")  # helpful for debugging
+        return redirect(f"{AUTH_URL}?{urlencode(q)}", code=302)
     return render_template("index.html")
 
 
 @app.route("/callback")
 def callback():
-    # TikTok sends ?code=...&state=...
+    if request.args.get("error"):
+        return f"❌ TikTok error: {request.args['error']}", 400
+
     code = request.args.get("code")
     state = request.args.get("state")
     if not code:
-        return "Missing 'code' from TikTok.", 400
-    if state != session.get("state"):
-        return "State mismatch.", 400
+        return "❌ Missing ?code from TikTok.", 400
+    if state != session.get("oauth_state"):
+        return "❌ State mismatch. Start login again.", 400
 
-    # exchange code for tokens
     r = requests.post(
         TOKEN_URL,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -98,15 +100,19 @@ def callback():
             "client_secret": CLIENT_SECRET,
             "code": code,
             "grant_type": "authorization_code",
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": REDIRECT_URI,  # MUST be identical to / authorize value
         },
         timeout=30,
     )
     if r.status_code >= 400:
-        return f"Token exchange failed: {r.status_code} {r.text}", r.status_code
+        return f"❌ Token exchange failed: {r.status_code} {r.text}", r.status_code
 
     data = r.json()
+    if "access_token" not in data:
+        return f"❌ Token response missing access_token: {data}", 400
+
     _save_tokens(data["access_token"], data["refresh_token"], data["expires_in"])
+    session["open_id"] = data.get("open_id")
     return redirect("/")
 
 
@@ -118,26 +124,27 @@ def logout():
 
 @app.route("/post", methods=["POST"])
 def post_video():
-    """Multipart form:
-       file : .mp4 (required)
-       title: caption (optional)
-       privacy: SELF_ONLY | PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS | FOLLOWER_OF_CREATOR
-       cover_ms: optional int
+    """
+    Form-data:
+      file     : required .mp4 file
+      title    : optional caption
+      privacy  : SELF_ONLY | PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS | FOLLOWER_OF_CREATOR
+      cover_ms : optional int frame timestamp for cover in ms
     """
     access_token = _ensure_access_token()
     if not access_token:
         return jsonify({"error": "Not authorized"}), 401
 
-    f = request.files.get("file")
-    if not f:
-        return jsonify({"error": "file (mp4) is required"}), 400
+    video = request.files.get("file")
+    if not video:
+        return jsonify({"error": "file is required (mp4)"}), 400
 
     title = request.form.get("title", "")
-    privacy = request.form.get("privacy", "SELF_ONLY")  # sandbox often forces private
+    privacy = request.form.get("privacy", "SELF_ONLY")  # sandbox usually private
     cover_ms = int(request.form.get("cover_ms", "0"))
 
-    # 1) Initialize Direct Post (FILE_UPLOAD avoids verified-domain requirement)
-    init_payload = {
+    # 1) Initialize Direct Post
+    init_body = {
         "post_info": {
             "title": title,
             "privacy_level": privacy,
@@ -146,9 +153,7 @@ def post_video():
             "disable_stitch": False,
             "video_cover_timestamp_ms": cover_ms
         },
-        "source_info": {
-            "source": "FILE_UPLOAD"
-        }
+        "source_info": { "source": "FILE_UPLOAD" }  # avoids verified-domain requirement
     }
     init_res = requests.post(
         DIRECT_POST_INIT,
@@ -156,7 +161,7 @@ def post_video():
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json; charset=UTF-8",
         },
-        json=init_payload,
+        json=init_body,
         timeout=60,
     )
     if init_res.status_code >= 400:
@@ -167,17 +172,16 @@ def post_video():
     publish_id = init["publish_id"]
 
     # 2) Upload raw bytes to the provided upload_url
-    video_bytes = f.read()
     put_res = requests.put(
         upload_url,
         headers={"Content-Type": "video/mp4"},
-        data=video_bytes,
+        data=video.read(),
         timeout=300,
     )
     if put_res.status_code >= 400:
         return jsonify({"step": "upload", "status": put_res.status_code, "response": put_res.text}), put_res.status_code
 
-    # 3) Fetch processing status (may return PROCESSING; you can poll client-side)
+    # 3) Get processing status (PROCESSING/FAILED/SUCCESS)
     status_res = requests.post(
         STATUS_FETCH,
         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
@@ -192,6 +196,30 @@ def post_video():
     })
 
 
+@app.route("/status")
+def get_status():
+    """Poll processing status for a publish_id: /status?publish_id=xxx"""
+    access_token = _ensure_access_token()
+    if not access_token:
+        return jsonify({"error": "Not authorized"}), 401
+
+    pid = request.args.get("publish_id")
+    if not pid:
+        return jsonify({"error": "publish_id required"}), 400
+
+    r = requests.post(
+        STATUS_FETCH,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json={"publish_id": pid},
+        timeout=30,
+    )
+    return jsonify(r.json()), r.status_code
+
+
+@app.route("/health")
+def health():
+    return "ok", 200
+
+
 if __name__ == "__main__":
-    # For local testing. On Render, use gunicorn (see below).
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
