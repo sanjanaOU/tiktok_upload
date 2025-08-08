@@ -1,41 +1,45 @@
 import os, time, secrets
 from urllib.parse import urlencode
-from flask import Flask, redirect, request, session, jsonify, render_template
+from flask import Flask, redirect, request, session, jsonify, render_template_string
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
 
 CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
 CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
-REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()  # MUST match console exactly
-
-# Hardcode scopes (space-separated; no commas)
-SCOPES = "user.info.basic video.upload video.publish"
+REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
 
 AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 DIRECT_POST_INIT = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 STATUS_FETCH = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
 
-app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
+# IMPORTANT: space-separated, not commas
+SCOPES = "user.info.basic video.upload video.publish"
 
 
-# ---------- token helpers ----------
-def save_tokens(access_token, refresh_token, expires_in):
+# ------------ helpers ------------
+def _new_state():
+    s = secrets.token_urlsafe(24)
+    session["oauth_state"] = s
+    return s
+
+def _save_tokens(tok):
+    # tok is the token JSON from TikTok
     session["tk"] = {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "expires_at": int(time.time()) + int(expires_in) - 60,  # refresh 60s early
+        "access_token": tok["access_token"],
+        "refresh_token": tok.get("refresh_token"),
+        "expires_at": int(time.time()) + int(tok.get("expires_in", 3600)) - 60,
     }
+    session["open_id"] = tok.get("open_id")
 
-def get_tokens():
-    data = session.get("tk") or {}
-    return data.get("access_token"), data.get("refresh_token"), data.get("expires_at", 0)
+def _get_tokens():
+    d = session.get("tk") or {}
+    return d.get("access_token"), d.get("refresh_token"), d.get("expires_at", 0)
 
-def ensure_access_token():
-    access_token, refresh_token, expires_at = get_tokens()
+def _ensure_access_token():
+    access_token, refresh_token, expires_at = _get_tokens()
     if not access_token:
         return None
     if time.time() < expires_at:
@@ -53,42 +57,63 @@ def ensure_access_token():
         timeout=30,
     )
     r.raise_for_status()
-    data = r.json()
-    save_tokens(data["access_token"], data["refresh_token"], data["expires_in"])
-    return data["access_token"]
+    _save_tokens(r.json())
+    return session["tk"]["access_token"]
 
 
-# ---------- routes ----------
+# ------------ routes ------------
 @app.route("/")
-def home():
-    access_token, *_ = get_tokens()
-    if not access_token:
-        state = secrets.token_urlsafe(24)
-        session["oauth_state"] = state
-        q = {
-            "client_key": CLIENT_KEY,
-            "response_type": "code",
-            "scope": SCOPES,               # space-separated
-            "redirect_uri": REDIRECT_URI,  # EXACT match with console
-            "state": state,
-        }
-        auth_url = f"{AUTH_URL}?{urlencode(q)}"
-        print("AUTH:", auth_url)  # keep for debugging
-        return redirect(auth_url, code=302)
-    return render_template("index.html")
+def index():
+    return (
+        "<h3>TikTok OAuth + Upload</h3>"
+        '<p><a href="/login">Login with TikTok</a></p>'
+        '<p><a href="/debug-auth">/debug-auth</a></p>'
+        '<p><a href="/form">Upload form</a></p>'
+    )
 
+@app.route("/debug-auth")
+def debug_auth():
+    state = session.get("oauth_state") or "(none yet)"
+    q = {
+        "client_key": CLIENT_KEY,
+        "response_type": "code",
+        "scope": SCOPES,               # space-separated
+        "redirect_uri": REDIRECT_URI,
+        "state": state,
+    }
+    return jsonify({
+        "client_key": CLIENT_KEY,
+        "redirect_uri_from_env": REDIRECT_URI,
+        "scopes": SCOPES,
+        "session_state": state,
+        "authorize_url": AUTH_URL + "?" + urlencode(q),
+    })
+
+@app.route("/login")
+def login():
+    state = _new_state()
+    q = {
+        "client_key": CLIENT_KEY,
+        "response_type": "code",
+        "scope": SCOPES,
+        "redirect_uri": REDIRECT_URI,   # must match console exactly
+        "state": state,
+        "force_verify": "1",            # show consent every time (handy while testing)
+    }
+    return redirect(AUTH_URL + "?" + urlencode(q), code=302)
 
 @app.route("/callback")
 def callback():
-    if request.args.get("error"):
-        return f"❌ TikTok error: {request.args['error']}", 400
+    err = request.args.get("error")
+    if err:
+        return f"❌ TikTok error: {err}", 400
 
     code = request.args.get("code")
     state = request.args.get("state")
     if not code:
-        return "❌ Missing ?code", 400
+        return "❌ Missing ?code from TikTok.", 400
     if state != session.get("oauth_state"):
-        return "❌ State mismatch", 400
+        return "❌ State mismatch. Start login again.", 400
 
     r = requests.post(
         TOKEN_URL,
@@ -98,44 +123,61 @@ def callback():
             "client_secret": CLIENT_SECRET,
             "code": code,
             "grant_type": "authorization_code",
-            "redirect_uri": REDIRECT_URI,  # identical to / authorize
+            "redirect_uri": REDIRECT_URI,
         },
         timeout=30,
     )
-    if r.status_code >= 400:
+    if r.status_code != 200:
         return f"❌ Token exchange failed: {r.status_code} {r.text}", r.status_code
 
-    data = r.json()
-    if "access_token" not in data:
-        return f"❌ Token response missing access_token: {data}", 400
+    tok = r.json()
+    if "access_token" not in tok:
+        return f"❌ Token response missing access_token: {tok}", 400
 
-    save_tokens(data["access_token"], data["refresh_token"], data["expires_in"])
-    session["open_id"] = data.get("open_id")
-    return redirect("/")
+    _save_tokens(tok)
+    return (
+        f"✅ Got token for open_id={session.get('open_id')}<br>"
+        f'<a href="/form">Go to upload form</a>'
+    )
 
-
-@app.route("/post", methods=["POST"])
-def post_video():
+# simple HTML upload form
+@app.route("/form")
+def form():
+    html = """
+    <h3>Post a TikTok video</h3>
+    <form action="/upload" method="post" enctype="multipart/form-data">
+      <div>Video (.mp4): <input type="file" name="file" accept="video/mp4" required></div>
+      <div>Caption: <input type="text" name="title" placeholder="Your caption"></div>
+      <div>Privacy:
+        <select name="privacy">
+          <option value="SELF_ONLY" selected>SELF_ONLY</option>
+          <option value="PUBLIC_TO_EVERYONE">PUBLIC_TO_EVERYONE</option>
+          <option value="MUTUAL_FOLLOW_FRIENDS">MUTUAL_FOLLOW_FRIENDS</option>
+          <option value="FOLLOWER_OF_CREATOR">FOLLOWER_OF_CREATOR</option>
+        </select>
+      </div>
+      <div>Cover timestamp (ms): <input type="number" name="cover_ms" value="0"></div>
+      <button type="submit">Upload & Post</button>
+    </form>
     """
-    Multipart form-data:
-      file     : required .mp4
-      title    : optional caption
-      privacy  : SELF_ONLY | PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS | FOLLOWER_OF_CREATOR
-      cover_ms : optional int (ms)
-    """
-    access_token = ensure_access_token()
+    return render_template_string(html)
+
+# MAIN: file upload -> post
+@app.route("/upload", methods=["POST"])
+def upload():
+    access_token = _ensure_access_token()
     if not access_token:
-        return jsonify({"error": "Not authorized"}), 401
+        return "Not authorized. Hit /login first.", 401
 
     f = request.files.get("file")
     if not f:
-        return jsonify({"error": "file is required (mp4)"}), 400
+        return jsonify({"error": "file is required (.mp4)"}), 400
 
     title = request.form.get("title", "")
-    privacy = request.form.get("privacy", "SELF_ONLY")  # sandbox usually private
+    privacy = request.form.get("privacy", "SELF_ONLY")  # sandbox often forces private
     cover_ms = int(request.form.get("cover_ms", "0"))
 
-    # 1) Initialize Direct Post with FILE_UPLOAD (avoids verified-domain requirement)
+    # 1) Initialize Direct Post (FILE_UPLOAD)
     init_body = {
         "post_info": {
             "title": title,
@@ -147,42 +189,45 @@ def post_video():
         },
         "source_info": { "source": "FILE_UPLOAD" }
     }
-    init = requests.post(
+    init_res = requests.post(
         DIRECT_POST_INIT,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=UTF-8"},
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+        },
         json=init_body,
         timeout=60,
     )
-    if init.status_code >= 400:
-        return jsonify({"step": "init", "status": init.status_code, "response": init.text}), init.status_code
+    if init_res.status_code >= 400:
+        return jsonify({"step": "init", "status": init_res.status_code, "response": init_res.text}), init_res.status_code
 
-    data = init.json()["data"]
+    data = init_res.json()["data"]
     upload_url = data["upload_url"]
     publish_id = data["publish_id"]
 
-    # 2) Upload raw bytes
-    up = requests.put(
+    # 2) PUT raw bytes to upload_url
+    put_res = requests.put(
         upload_url,
         headers={"Content-Type": "video/mp4"},
         data=f.read(),
         timeout=300,
     )
-    if up.status_code >= 400:
-        return jsonify({"step": "upload", "status": up.status_code, "response": up.text}), up.status_code
+    if put_res.status_code >= 400:
+        return jsonify({"step": "upload", "status": put_res.status_code, "response": put_res.text}), put_res.status_code
 
-    # 3) Fetch status (PROCESSING/SUCCESS/FAILED)
-    status = requests.post(
+    # 3) Poll status once (you can also call /status later)
+    st = requests.post(
         STATUS_FETCH,
         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
         json={"publish_id": publish_id},
         timeout=30,
     )
-    return jsonify({"ok": True, "publish_id": publish_id, "status": status.json()})
 
+    return jsonify({"ok": True, "publish_id": publish_id, "status": st.json()})
 
 @app.route("/status")
-def get_status():
-    access_token = ensure_access_token()
+def status():
+    access_token = _ensure_access_token()
     if not access_token:
         return jsonify({"error": "Not authorized"}), 401
     pid = request.args.get("publish_id")
@@ -197,29 +242,10 @@ def get_status():
     return jsonify(r.json()), r.status_code
 
 
-@app.route("/debug-auth")
-def debug_auth():
-    # Quick view of what we're sending to TikTok
-    q = {
-        "client_key": CLIENT_KEY,
-        "response_type": "code",
-        "scope": SCOPES,
-        "redirect_uri": REDIRECT_URI,
-        "state": "debug",
-    }
-    return {"SCOPES": SCOPES, "REDIRECT_URI": REDIRECT_URI, "AUTH_URL": f"{AUTH_URL}?{urlencode(q)}"}
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return "Logged out. Reload / to re-auth."
-
-
 @app.route("/health")
 def health():
     return "ok", 200
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5051)), debug=True)
