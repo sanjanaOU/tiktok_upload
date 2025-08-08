@@ -1,14 +1,16 @@
 import os
 import secrets
 from urllib.parse import urlencode
+from pathlib import Path
 
 import requests
 from flask import (
-    Flask, request, session, redirect, jsonify, make_response
+    Flask, request, session, redirect, jsonify, make_response,
+    send_from_directory
 )
 
 # ------------------------------------------------------------------------------
-# ENV VARS you must set in Render (or a .env when running locally):
+# REQUIRED ENV (Render "Environment" or local .env):
 #   TIKTOK_CLIENT_KEY=sbawemm7fb4n0ps8iz
 #   TIKTOK_CLIENT_SECRET=uF1lxNnTU20eDtoqojsfQe75HA5Jvn4g
 #   REDIRECT_URI=https://tiktok-upload.onrender.com/callback
@@ -28,6 +30,8 @@ SCOPES = "user.info.basic,video.upload,video.publish"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
 
+MEDIA_DIR = Path(__file__).parent / "media"  # optional local hosting
+
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -39,8 +43,8 @@ def new_state():
 
 
 def json_or_text(resp):
-    """Return (status_code, body, is_json) for robust logging"""
-    ct = resp.headers.get("content-type", "")
+    """Return (status_code, body, is_json) for robust logging."""
+    ct = (resp.headers.get("content-type") or "").lower()
     if ct.startswith("application/json"):
         try:
             return resp.status_code, resp.json(), True
@@ -50,9 +54,7 @@ def json_or_text(resp):
 
 
 def require_auth():
-    if not session.get("access_token") or not session.get("open_id"):
-        return False
-    return True
+    return bool(session.get("access_token") and session.get("open_id"))
 
 
 # ------------------------------------------------------------------------------
@@ -68,7 +70,8 @@ def index():
             <p><a href="/upload">Publish a video from VERIFIED URL</a></p>
             <p><a href="/logout">Logout</a></p>
             <p><a href="/debug-auth">/debug-auth</a></p>
-            """, 200
+            """,
+            200,
         )
     else:
         return make_response(
@@ -76,7 +79,8 @@ def index():
             <h3>TikTok OAuth</h3>
             <p><a href="/login">Login with TikTok</a></p>
             <p><a href="/debug-auth">/debug-auth</a></p>
-            """, 200
+            """,
+            200,
         )
 
 
@@ -90,7 +94,7 @@ def login():
         "redirect_uri": REDIRECT_URI,
         "state": state,
     }
-    return redirect(AUTH_URL + "?" + urlencode(params), code=302)
+    return redirect(AUTH_URL + "?" + urlencode(params), 302)
 
 
 @app.route("/callback")
@@ -112,10 +116,11 @@ def callback():
         "client_secret": CLIENT_SECRET,
         "code": code,
         "grant_type": "authorization_code",
-        "redirect_uri": REDIRECT_URI,  # must match exactly
+        "redirect_uri": REDIRECT_URI,  # MUST match exactly
     }
+
     r = requests.post(TOKEN_URL, headers=headers, data=urlencode(payload), timeout=30)
-    status, body, is_json = json_or_text(r)
+    status, body, _ = json_or_text(r)
 
     if status != 200 or ("access_token" not in body):
         return make_response(
@@ -142,30 +147,40 @@ def debug_auth():
         "redirect_uri": REDIRECT_URI,
         "state": session.get("oauth_state") or "(none yet)",
     }
-    return jsonify({
-        "client_key": CLIENT_KEY[:4] + "***",
-        "redirect_uri_from_env": REDIRECT_URI,
-        "authorize_url": AUTH_URL + "?" + urlencode(params),
-        "has_token": bool(session.get("access_token")),
-        "open_id": session.get("open_id"),
-    })
+    return jsonify(
+        {
+            "client_key_starts_with": CLIENT_KEY[:4],
+            "redirect_uri_from_env": REDIRECT_URI,
+            "authorize_url": AUTH_URL + "?" + urlencode(params),
+            "has_token": bool(session.get("access_token")),
+            "open_id": session.get("open_id"),
+        }
+    )
 
 
 # ------------------------------------------------------------------------------
-# Simple UI + publish-by-URL flow (PULL_FROM_URL)
+# Optional local hosting for verified URLs (drop files into ./media and commit)
+# Access as: https://<your-service>/media/filename.mp4
+# ------------------------------------------------------------------------------
+@app.route("/media/<path:filename>")
+def media(filename):
+    return send_from_directory(MEDIA_DIR, filename, as_attachment=False)
+
+
+# ------------------------------------------------------------------------------
+# UI + publish-by-URL flow (PULL_FROM_URL)
 # ------------------------------------------------------------------------------
 @app.route("/upload", methods=["GET"])
 def upload_page():
     if not require_auth():
         return redirect("/login")
-    # Simple inline form and client-side fetch to POST /publish-by-url
     return make_response(
         """
         <h2>Publish to TikTok: Pull From Verified URL</h2>
         <p><b>Important:</b> The video URL must be hosted on a domain you've verified in the TikTok Developer Portal.</p>
         <form id="f" onsubmit="return false">
           <label>Public video URL (.mp4) on VERIFIED domain</label><br>
-          <input style="width:600px" name="video_url" value="" placeholder="https://tiktok-upload.onrender.com/media/example.mp4"/><br><br>
+          <input style="width:600px" name="video_url" placeholder="https://your-service.onrender.com/media/example.mp4"/><br><br>
           <label>Caption</label><br>
           <input style="width:600px" name="caption" value="Hello from API!"/><br><br>
           <button onclick="doUpload()">Publish</button>
@@ -178,16 +193,28 @@ def upload_page():
           const video_url = fd.get('video_url');
           const caption = fd.get('caption');
 
-          const res = await fetch('/publish-by-url', {
-            method: 'POST',
-            headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({video_url, caption})
-          });
-          const data = await res.json().catch(() => ({non_json: true, body: await res.text()}));
+          let data;
+          try {
+            const res = await fetch('/publish-by-url', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ video_url, caption })
+            });
+
+            try {
+              data = await res.json();
+            } catch (e) {
+              data = { non_json: true, status: res.status, body: await res.text() };
+            }
+          } catch (networkErr) {
+            data = { error: 'network_error', message: String(networkErr) };
+          }
+
           document.getElementById('out').textContent = JSON.stringify(data, null, 2);
         }
         </script>
-        """, 200
+        """,
+        200,
     )
 
 
@@ -206,14 +233,14 @@ def publish_by_url():
     access_token = session["access_token"]
     open_id = session["open_id"]
 
-    # ---- Step 1: Create container with PULL_FROM_URL ----
     step1_json = {}
     step2_json = {}
     try:
+        # ---- Step 1: Create container using PULL_FROM_URL ----
         create_payload = {
             "source_info": {
                 "source": "PULL_FROM_URL",
-                "video_url": video_url,  # must be on a verified domain
+                "video_url": video_url,  # must be on your verified domain
             },
             "text": caption,
         }
@@ -229,12 +256,15 @@ def publish_by_url():
         status1, body1, _ = json_or_text(r1)
         step1_json = {"status": status1, "response": body1}
 
-        if status1 != 200 or not isinstance(body1, dict) or "data" not in body1 or "container_id" not in body1["data"]:
-            return jsonify({
-                "step": "create_container",
-                "status": status1,
-                "response": body1
-            }), 400
+        if (
+            status1 != 200
+            or not isinstance(body1, dict)
+            or "data" not in body1
+            or "container_id" not in body1["data"]
+        ):
+            return jsonify(
+                {"step": "create_container", "status": status1, "response": body1}
+            ), 400
 
         container_id = body1["data"]["container_id"]
 
@@ -252,27 +282,33 @@ def publish_by_url():
         step2_json = {"status": status2, "response": body2}
 
         if status2 != 200:
-            return jsonify({
-                "step": "publish",
-                "status": status2,
-                "response": body2,
-                "container_id": container_id
-            }), 400
+            return jsonify(
+                {
+                    "step": "publish",
+                    "status": status2,
+                    "response": body2,
+                    "container_id": container_id,
+                }
+            ), 400
 
-        return jsonify({
-            "ok": True,
-            "container_id": container_id,
-            "create_container": step1_json,
-            "publish": step2_json
-        }), 200
+        return jsonify(
+            {
+                "ok": True,
+                "container_id": container_id,
+                "create_container": step1_json,
+                "publish": step2_json,
+            }
+        ), 200
 
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-            "create_container": step1_json,
-            "publish": step2_json
-        }), 500
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(e),
+                "create_container": step1_json,
+                "publish": step2_json,
+            }
+        ), 500
 
 
 # ------------------------------------------------------------------------------
