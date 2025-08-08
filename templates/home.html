@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>TikTok Uploader</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+           background:#111; color:#eee; margin:0; }
+    .wrap { max-width: 760px; margin: 60px auto; padding: 24px; background:#000; border:1px solid #333; border-radius: 10px; }
+    a.btn { color:#000; background:#fff; padding:10px 16px; border-radius:8px; text-decoration:none; font-weight:600; }
+    a.btn:hover { background:#ddd; }
+    .muted { color:#bbb; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>TikTok Uploader</h1>
+    {% if authed %}
+      <p class="muted">Logged in as <code>{{ open_id }}</code>.</p>
+      <p><a class="btn" href="/upload">Upload a video</a></p>
+      <p><a class="btn" href="/logout">Logout</a></p>
+    {% else %}
+      <p class="muted">You’re not authenticated with TikTok.</p>
+      <p><a class="btn" href="/login">Login with TikTok</a></p>
+    {% endif %}
+    <p><a class="muted" href="/debug-auth">debug-auth</a></p>
+  </div>
+</body>
+</html>

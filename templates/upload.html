@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Upload TikTok Video</title>
+  <style>
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial; background:#111; color:#eee; margin:0; }
+    .wrap { max-width: 760px; margin: 40px auto; padding: 24px; background:#000; border:1px solid #333; border-radius: 10px; }
+    input, textarea { width:100%; padding:10px; border-radius:8px; border:1px solid #333; background:#111; color:#eee; }
+    label { display:block; margin:12px 0 6px; color:#bbb; }
+    button { background:#fff; color:#000; border:none; padding:12px 18px; border-radius:8px; font-weight:600; cursor:pointer; }
+    button:hover { background:#ddd; }
+    .flash { margin: 12px 0; padding: 10px 12px; border-radius: 8px; }
+    .success { background: #0f5132; color:#d1e7dd; }
+    .error { background: #842029; color:#f8d7da; }
+    .info { background:#1d2a39; color:#cfe2ff; }
+    pre { background:#111; padding:12px; border-radius:8px; border:1px solid #333; overflow:auto; }
+    a { color:#9ecbff; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <p><a href="/">← Back</a></p>
+    <h2>Upload & Publish</h2>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for cat, msg in messages %}
+          <div class="flash {{cat}}">{{ msg }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="post" action="/upload-by-url">
+      <label>Public Video URL (.mp4)</label>
+      <input name="video_url" placeholder="https://example.com/file.mp4" required>
+
+      <label>Caption</label>
+      <textarea name="caption" rows="3" placeholder="Optional caption..."></textarea>
+
+      <p><button type="submit">Upload to TikTok</button></p>
+    </form>
+
+    {% if published %}
+      <h3>Publish result</h3>
+      <pre>{{ result|tojson(indent=2) }}</pre>
+    {% endif %}
+  </div>
+</body>
+</html>
