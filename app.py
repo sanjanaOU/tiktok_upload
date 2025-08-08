@@ -100,11 +100,17 @@ def upload():
     if not f:
         return jsonify({"error": "file is required (.mp4)"}), 400
 
+    # Read the file once into memory so we know its size and can reuse the bytes for PUT
+    video_bytes = f.read()
+    if not video_bytes:
+        return jsonify({"error": "uploaded file is empty"}), 400
+    video_size = len(video_bytes)
+
     title    = request.form.get("title", "")
     privacy  = request.form.get("privacy", "SELF_ONLY")
     cover_ms = int(request.form.get("cover_ms", "0"))
 
-    # 1) Initialize Direct Post (FILE_UPLOAD)
+    # 1) Initialize Direct Post (FILE_UPLOAD) — include upload_param.video_size
     init_body = {
         "post_info": {
             "title": title,
@@ -114,7 +120,8 @@ def upload():
             "disable_stitch": False,
             "video_cover_timestamp_ms": cover_ms
         },
-        "source_info": {"source": "FILE_UPLOAD"}
+        "source_info": {"source": "FILE_UPLOAD"},
+        "upload_param": {"video_size": video_size}
     }
     init_res = requests.post(
         DIRECT_POST_INIT,
@@ -132,11 +139,11 @@ def upload():
     upload_url = init["upload_url"]
     publish_id = init["publish_id"]
 
-    # 2) PUT raw bytes to upload_url
+    # 2) Upload the bytes
     put_res = requests.put(
         upload_url,
         headers={"Content-Type": "video/mp4"},
-        data=f.read(),
+        data=video_bytes,
         timeout=300,
     )
     if put_res.status_code >= 400:
@@ -151,6 +158,7 @@ def upload():
     )
 
     return jsonify({"ok": True, "publish_id": publish_id, "status": st.json()})
+
 
 @app.route("/status")
 def status():
@@ -179,3 +187,5 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5051)), debug=True)
+
+
