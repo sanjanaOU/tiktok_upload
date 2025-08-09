@@ -7,12 +7,11 @@ import requests
 app = Flask(__name__)
 
 # ========= ENV (Render) =========
-# Set these in Render → Environment:
 # TIKTOK_CLIENT_KEY=...
 # TIKTOK_CLIENT_SECRET=...
 # REDIRECT_URI=https://tiktok-upload.onrender.com/callback
 # FLASK_SECRET_KEY=<long random>
-# (optional) ACCESS_TOKEN=act.xxxxx  # lets you skip OAuth
+# (optional) ACCESS_TOKEN=act.xxxxx
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
 
 CLIENT_KEY    = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
@@ -25,7 +24,7 @@ AUTH_URL          = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL         = "https://open.tiktokapis.com/v2/oauth/token/"
 DIRECT_POST_INIT  = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 STATUS_FETCH      = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
-SCOPES            = "user.info.basic,video.upload,video.publish"  # commas work for TikTok
+SCOPES            = "user.info.basic,video.upload,video.publish"
 
 # ========= Helpers =========
 def new_state():
@@ -47,12 +46,7 @@ def get_tokens():
     return data.get("access_token"), data.get("refresh_token"), data.get("expires_at", 0)
 
 def access_token():
-    """
-    Priority:
-      1) OAuth token in session (no refresh here; simple + reliable)
-      2) ACCESS_TOKEN env
-    """
-    tok, _refresh, exp = get_tokens()
+    tok, _r, exp = get_tokens()
     if tok and time.time() < exp:
         return tok
     if ACCESS_TOKEN_ENV:
@@ -164,7 +158,6 @@ def callback():
     if r.status_code != 200:
         return f"❌ Token exchange failed: {r.status_code} {tok}", r.status_code
 
-    # TikTok may respond with top-level fields or under "data"
     data = tok.get("data", tok)
     if "access_token" not in data:
         return f"❌ Token response missing access_token: {tok}", 400
@@ -225,12 +218,13 @@ def upload():
     if not video_bytes:
         return jsonify({"error": "uploaded file is empty"}), 400
     video_size = len(video_bytes)
+    app.logger.info(f"video_size={video_size}")
 
     title    = request.form.get("title", "")
     privacy  = request.form.get("privacy", "SELF_ONLY")
     cover_ms = int(request.form.get("cover_ms", "0"))
 
-    # 1) INIT — include upload_param.video_size (required)
+    # 1) INIT — video_size inside source_info (fix for 'video info is empty')
     init_body = {
         "post_info": {
             "title": title,
@@ -240,15 +234,17 @@ def upload():
             "disable_stitch": False,
             "video_cover_timestamp_ms": cover_ms,
         },
-        "source_info": {"source": "FILE_UPLOAD"},
-        "upload_param": {"video_size": video_size},
+        "source_info": {
+            "source": "FILE_UPLOAD",
+            "video_size": video_size,  # <-- moved here
+        },
     }
 
     init_res = requests.post(
         DIRECT_POST_INIT,
         headers={
             "Authorization": f"Bearer {tok}",
-            "Content-Type": "application/json; charset=UTF-8",
+            "Content-Type": "application/json",
         },
         json=init_body,
         timeout=60,
