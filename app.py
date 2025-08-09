@@ -1,29 +1,29 @@
 # app.py
-import os, time, secrets
+import os
+import time
+import secrets
 from urllib.parse import urlencode
 from flask import Flask, redirect, request, session, jsonify, render_template_string
 import requests
 
 app = Flask(__name__)
 
-# ========= ENV (Render) =========
-# TIKTOK_CLIENT_KEY=...
-# TIKTOK_CLIENT_SECRET=...
-# REDIRECT_URI=https://tiktok-upload.onrender.com/callback
-# FLASK_SECRET_KEY=<long random>
-# (optional) ACCESS_TOKEN=act.xxxxx
+# ========= ENV (Render or .env) =========
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
 
-CLIENT_KEY    = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
-CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
-REDIRECT_URI  = os.getenv("REDIRECT_URI", "").strip()
-ACCESS_TOKEN_ENV = os.getenv("ACCESS_TOKEN", "").strip()
+CLIENT_KEY        = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
+CLIENT_SECRET     = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
+REDIRECT_URI      = os.getenv("REDIRECT_URI", "").strip()
+ACCESS_TOKEN_ENV  = os.getenv("ACCESS_TOKEN", "").strip()  # optional
 
 # ========= TikTok endpoints =========
 AUTH_URL          = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL         = "https://open.tiktokapis.com/v2/oauth/token/"
+
 DIRECT_POST_INIT  = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 STATUS_FETCH      = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
+WHOAMI_URL        = "https://open.tiktokapis.com/v2/user/info/"
+
 SCOPES            = "user.info.basic,video.upload,video.publish"
 
 # ========= Helpers =========
@@ -36,7 +36,7 @@ def save_tokens(access_token, refresh_token=None, expires_in=3600, open_id=None)
     session["tk"] = {
         "access_token": access_token,
         "refresh_token": refresh_token or "",
-        "expires_at": int(time.time()) + int(expires_in) - 60,
+        "expires_at": int(time.time()) + int(expires_in) - 60,  # renew 60s early
     }
     if open_id:
         session["open_id"] = open_id
@@ -46,9 +46,11 @@ def get_tokens():
     return data.get("access_token"), data.get("refresh_token"), data.get("expires_at", 0)
 
 def access_token():
+    # session token (valid)
     tok, _r, exp = get_tokens()
     if tok and time.time() < exp:
         return tok
+    # fallback to ACCESS_TOKEN env if you want to skip OAuth
     if ACCESS_TOKEN_ENV:
         return ACCESS_TOKEN_ENV
     return None
@@ -58,7 +60,7 @@ HOME_HTML = """
 <h2>TikTok OAuth + Local File Upload</h2>
 <ol>
   <li><a href="/login">Login with TikTok</a> → after callback, go to <a href="/form">/form</a></li>
-  <li>Skip OAuth: call <code>/set-token?access_token=act....&open_id=...&expires_in=86400</code>, then open <a href="/form">/form</a></li>
+  <li>Skip OAuth (optional): call <code>/set-token?access_token=act....&open_id=...&expires_in=86400</code>, then open <a href="/form">/form</a></li>
 </ol>
 <p>
   Debug: <a href="/debug-auth" target="_blank">/debug-auth</a> •
@@ -119,7 +121,7 @@ def login():
         "scope": SCOPES,
         "redirect_uri": REDIRECT_URI,
         "state": state,
-        "force_verify": "1",
+        "force_verify": "1",  # force TikTok to re-prompt and re-consent
     }
     return redirect(AUTH_URL + "?" + urlencode(params), code=302)
 
@@ -166,7 +168,7 @@ def callback():
         data["access_token"],
         data.get("refresh_token"),
         data.get("expires_in", 3600),
-        data.get("open_id")
+        data.get("open_id"),
     )
     return '✅ Logged in. <a href="/form">Go to /form</a>'
 
@@ -192,18 +194,14 @@ def whoami():
     tok = access_token()
     if not tok:
         return {"error": "no token"}, 401
-    r = requests.get(
-        "https://open.tiktokapis.com/v2/user/info/",
-        headers={"Authorization": f"Bearer {tok}"},
-        timeout=20
-    )
+    r = requests.get(WHOAMI_URL, headers={"Authorization": f"Bearer {tok}"}, timeout=20)
     try:
         body = r.json()
     except Exception:
         body = r.text
     return {"status": r.status_code, "body": body}, r.status_code
 
-# ---- Upload & Status ----
+# ========= Upload & Publish =========
 @app.route("/upload", methods=["POST"])
 def upload():
     tok = access_token()
@@ -217,14 +215,18 @@ def upload():
     video_bytes = f.read()
     if not video_bytes:
         return jsonify({"error": "uploaded file is empty"}), 400
+
     video_size = len(video_bytes)
-    app.logger.info(f"video_size={video_size}")
+    file_name  = getattr(f, "filename", "video.mp4") or "video.mp4"
+    mime_type  = "video/mp4"
 
     title    = request.form.get("title", "")
     privacy  = request.form.get("privacy", "SELF_ONLY")
     cover_ms = int(request.form.get("cover_ms", "0"))
 
-    # 1) INIT — video_size inside source_info (fix for 'video info is empty')
+    app.logger.info(f"[UPLOAD] size={video_size} name={file_name} mime={mime_type}")
+
+    # ---- INIT payload (compatible across tenants)
     init_body = {
         "post_info": {
             "title": title,
@@ -236,9 +238,18 @@ def upload():
         },
         "source_info": {
             "source": "FILE_UPLOAD",
-            "video_size": video_size,  # <-- moved here
+            "video_size": video_size,   # preferred location
+            "file_name": file_name,
+            "mime_type": mime_type,
+            "chunk_size": video_size,   # one-shot upload (harmless if ignored)
+            "chunk_number": 1
+        },
+        "upload_param": {
+            "video_size": video_size    # some tenants still read it here
         },
     }
+
+    app.logger.info(f"[INIT] body={init_body}")
 
     init_res = requests.post(
         DIRECT_POST_INIT,
@@ -249,6 +260,8 @@ def upload():
         json=init_body,
         timeout=60,
     )
+    app.logger.info(f"[INIT] status={init_res.status_code} text={init_res.text[:500]}")
+
     if init_res.status_code >= 400:
         return jsonify({"step": "init", "status": init_res.status_code, "response": init_res.text}), init_res.status_code
 
@@ -261,17 +274,19 @@ def upload():
 
     session["last_publish_id"] = publish_id
 
-    # 2) PUT bytes to upload_url
+    # ---- PUT raw bytes to the pre-signed URL
     put_res = requests.put(
         upload_url,
-        headers={"Content-Type": "video/mp4"},
+        headers={"Content-Type": mime_type},
         data=video_bytes,
         timeout=300,
     )
+    app.logger.info(f"[PUT] status={put_res.status_code} (len={len(video_bytes)}) text={put_res.text[:200]}")
+
     if put_res.status_code >= 400:
         return jsonify({"step": "upload", "status": put_res.status_code, "response": put_res.text}), put_res.status_code
 
-    # 3) First status check
+    # ---- First status check
     st = requests.post(
         STATUS_FETCH,
         headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
@@ -299,6 +314,7 @@ def status_last():
     pid = session.get("last_publish_id")
     if not pid:
         return jsonify({"error": "no publish_id stored in this session"}), 400
+
     r = requests.post(
         STATUS_FETCH,
         headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
