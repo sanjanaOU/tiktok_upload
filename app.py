@@ -111,7 +111,22 @@ UPLOAD_FORM_HTML = """
                 <label for="direct_post">
                     <input type="checkbox" name="direct_post" checked> Direct Post (publish immediately)
                 </label>
-                <small>Uncheck to use inbox flow (video goes to your TikTok inbox for manual posting)</small>
+                <small>
+                    <strong>Requirements for Direct Post:</strong><br>
+                    • Your TikTok developer app must be <strong>audited and approved</strong> by TikTok<br>
+                    • Unaudited apps can only post to <strong>private accounts</strong><br>
+                    • Content from unaudited apps is restricted to private viewing<br>
+                    • If Direct Post fails, it will automatically fallback to inbox flow
+                </small>
+            </div>
+            
+            <div class="form-group">
+                <p><strong>Privacy Level Options:</strong></p>
+                <ul style="font-size: 12px; margin-top: 5px;">
+                    <li><strong>PUBLIC_TO_EVERYONE</strong> - Public (visible to all)</li>
+                    <li><strong>MUTUAL_FOLLOW_FRIENDS</strong> - Friends only</li>
+                    <li><strong>SELF_ONLY</strong> - Private (only you can see)</li>
+                </ul>
             </div>
             
             <button type="submit">Upload Video</button>
@@ -147,6 +162,9 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
     Upload a video to TikTok using either:
     1. Direct Post (publishes immediately with metadata) 
     2. Inbox flow (uploads to user's inbox for manual posting)
+    
+    IMPORTANT: For direct post to work, your TikTok app must be audited and approved by TikTok.
+    Unaudited apps can only post to private accounts and content will be restricted to private viewing.
     """
     headers = get_auth_headers()
     if not headers:
@@ -165,13 +183,11 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
         print(f"Step 1: Initializing {'direct post' if direct_post else 'inbox'} upload...")
         
         if direct_post:
-            # Direct Post API - includes post metadata
+            # Direct Post API - CORRECTED STRUCTURE
             init_data = {
                 "post_info": {
                     "title": title or "Uploaded via API",
-                    "privacy_level": {
-                        "privacy_level_option": privacy_level
-                    },
+                    "privacy_level": privacy_level,  # Direct string, not nested object
                     "disable_duet": disable_duet,
                     "disable_comment": disable_comment,
                     "disable_stitch": disable_stitch,
@@ -185,10 +201,6 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
                     "total_chunk_count": 1
                 }
             }
-            
-            # Add description if provided
-            if description:
-                init_data["post_info"]["text"] = description
         else:
             # Inbox API - only source info
             init_data = {
@@ -218,11 +230,26 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
         print(f"Init response: {init_response.text}")
         
         if init_response.status_code != 200:
-            # If direct post fails, try inbox flow as fallback
-            if direct_post:
-                print("Direct post failed, trying inbox flow...")
-                return upload_video_to_tiktok(video_file, title, description, privacy_level, 
-                                            disable_duet, disable_comment, disable_stitch, False)
+            # Try to parse error message
+            try:
+                error_data = init_response.json()
+                error_msg = error_data.get("error", {}).get("message", init_response.text)
+                error_code = error_data.get("error", {}).get("code", "unknown")
+                
+                # Check for common direct post restrictions
+                if "unaudited_client" in error_code or "private_accounts" in error_msg:
+                    return {"error": f"Direct Post Error: Your app needs to be audited by TikTok for public posting. Current restriction: {error_msg}. Try setting your TikTok account to private or use inbox flow."}
+                elif "privacy_level_option_mismatch" in error_code:
+                    return {"error": f"Privacy Level Error: {error_msg}. The privacy level '{privacy_level}' may not be available for your account."}
+                
+                # If direct post fails, try inbox flow as fallback
+                if direct_post:
+                    print(f"Direct post failed with error: {error_msg}, trying inbox flow...")
+                    return upload_video_to_tiktok(video_file, title, description, privacy_level, 
+                                                disable_duet, disable_comment, disable_stitch, False)
+            except:
+                pass
+                
             return {"error": f"Init failed (HTTP {init_response.status_code}): {init_response.text}"}
         
         try:
@@ -233,9 +260,18 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
         # Check for errors in response
         error_info = init_result.get("error", {})
         if error_info.get("code") != "ok":
+            error_msg = error_info.get("message", "Unknown error")
+            error_code = error_info.get("code", "unknown")
+            
+            # Check for specific direct post errors
+            if "unaudited_client" in error_code:
+                return {"error": f"Direct Post requires app audit: {error_msg}. Your app needs TikTok approval for public posting."}
+            elif "privacy_level_option_mismatch" in error_code:
+                return {"error": f"Privacy setting error: {error_msg}. Try a different privacy level."}
+            
             # If direct post fails, try inbox flow as fallback
             if direct_post:
-                print("Direct post failed, trying inbox flow...")
+                print(f"Direct post failed with API error: {error_info}, trying inbox flow...")
                 return upload_video_to_tiktok(video_file, title, description, privacy_level, 
                                             disable_duet, disable_comment, disable_stitch, False)
             return {"error": f"Init API error: {error_info}"}
@@ -250,8 +286,13 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
         if not publish_id or not upload_url:
             return {"error": f"Init response missing publish_id or upload_url: {init_result}"}
         
+        # Check publish_id format to confirm direct post vs inbox
+        is_direct_post = publish_id.startswith("v_pub_")
+        is_inbox = publish_id.startswith("v_inbox_")
+        
         print(f"✅ Init successful. Publish ID: {publish_id}")
         print(f"Upload URL: {upload_url}")
+        print(f"Detected mode: {'Direct Post' if is_direct_post else 'Inbox' if is_inbox else 'Unknown'}")
         
         # Step 2: Upload video content to TikTok servers
         print("Step 2: Uploading video content...")
@@ -281,19 +322,29 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
         
         print("✅ Upload successful!")
         
-        if direct_post:
+        # Determine actual result type based on publish_id
+        if is_direct_post:
             return {
                 "success": True,
                 "publish_id": publish_id,
-                "message": "Video published directly to TikTok! It may take a few minutes to appear.",
-                "type": "direct_post"
+                "message": "Video published directly to TikTok! It may take a few minutes to appear on your profile.",
+                "type": "direct_post",
+                "note": "This was published directly to your TikTok profile."
+            }
+        elif is_inbox:
+            return {
+                "success": True,
+                "publish_id": publish_id,
+                "message": "Video uploaded to your TikTok inbox! Check your TikTok app notifications to complete posting.",
+                "type": "inbox_flow",
+                "note": "This went to your TikTok inbox for manual posting."
             }
         else:
             return {
                 "success": True,
                 "publish_id": publish_id,
-                "message": "Video uploaded to your TikTok inbox! Check your TikTok app notifications to complete posting.",
-                "type": "inbox_flow"
+                "message": "Video uploaded successfully! Check your TikTok app to see where it appeared.",
+                "type": "unknown"
             }
         
     except Exception as e:
@@ -446,27 +497,41 @@ def upload():
     result = upload_video_to_tiktok(
         video_file=video_file,
         title=title,
-        description=description
+        description=description,
+        privacy_level=privacy_level,
+        disable_duet=disable_duet,
+        disable_comment=disable_comment,
+        disable_stitch=disable_stitch,
+        direct_post=direct_post
     )
     
     if result.get("error"):
         return f"❌ Upload failed: {result['error']}", 400
     
-    return f"""
-    ✅ Video uploaded successfully to your TikTok inbox!<br>
-    Publish ID: {result.get('publish_id', 'N/A')}<br>
-    <br>
-    <strong>Next steps:</strong><br>
-    1. Open your TikTok app<br>
-    2. Check your notifications/inbox<br>
-    3. Find your uploaded video<br>
-    4. Add captions, hashtags, and privacy settings<br>
-    5. Post the video<br>
-    <br>
-    <p><em>{result.get('note', '')}</em></p>
-    <br>
-    <a href="/upload">Upload Another Video</a> | <a href="/">Home</a>
-    """
+    if result.get("type") == "direct_post":
+        return f"""
+        ✅ Video published directly to TikTok!<br>
+        Publish ID: {result.get('publish_id', 'N/A')}<br>
+        <br>
+        <strong>Your video has been posted to your TikTok profile!</strong><br>
+        It may take a few minutes to appear on your profile.<br>
+        <br>
+        <a href="/upload">Upload Another Video</a> | <a href="/">Home</a>
+        """
+    else:
+        return f"""
+        ✅ Video uploaded successfully to your TikTok inbox!<br>
+        Publish ID: {result.get('publish_id', 'N/A')}<br>
+        <br>
+        <strong>Next steps:</strong><br>
+        1. Open your TikTok app<br>
+        2. Check your notifications/inbox<br>
+        3. Find your uploaded video<br>
+        4. Add captions, hashtags, and privacy settings<br>
+        5. Post the video<br>
+        <br>
+        <a href="/upload">Upload Another Video</a> | <a href="/">Home</a>
+        """
 
 
 @app.route("/logout")
