@@ -27,12 +27,13 @@ REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
 AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 
-# TikTok API endpoints for video upload
-CONTENT_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/content/init/"
-CONTENT_UPLOAD_URL = "https://open.tiktokapis.com/v2/post/publish/content/upload/"
-CONTENT_PUBLISH_URL = "https://open.tiktokapis.com/v2/post/publish/"
+# TikTok API endpoints for video upload (Inbox flow - videos go to user's inbox for manual posting)
+CONTENT_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
 
 SCOPES = "user.info.basic,video.upload,video.publish"
+
+# Maximum file size (TikTok limit is around 287MB)
+MAX_FILE_SIZE = 287 * 1024 * 1024  # 287MB in bytes
 
 # Upload form HTML template
 UPLOAD_FORM_HTML = """
@@ -67,40 +68,17 @@ UPLOAD_FORM_HTML = """
             </div>
             
             <div class="form-group">
-                <label for="title">Title:</label>
-                <input type="text" name="title" placeholder="Enter video title" required>
+                <label for="title">Title (Optional for inbox flow):</label>
+                <input type="text" name="title" placeholder="Enter video title (will be added in TikTok app)">
             </div>
             
             <div class="form-group">
-                <label for="description">Description:</label>
-                <textarea name="description" placeholder="Enter video description (optional)"></textarea>
+                <label for="description">Description (Optional for inbox flow):</label>
+                <textarea name="description" placeholder="Enter video description (will be added in TikTok app)"></textarea>
             </div>
             
             <div class="form-group">
-                <label for="privacy_level">Privacy Level:</label>
-                <select name="privacy_level">
-                    <option value="SELF_ONLY">Private</option>
-                    <option value="MUTUAL_FOLLOW_FRIENDS">Friends</option>
-                    <option value="PUBLIC_TO_EVERYONE" selected>Public</option>
-                </select>
-            </div>
-            
-            <div class="form-group">
-                <label for="disable_duet">
-                    <input type="checkbox" name="disable_duet"> Disable Duet
-                </label>
-            </div>
-            
-            <div class="form-group">
-                <label for="disable_comment">
-                    <input type="checkbox" name="disable_comment"> Disable Comments
-                </label>
-            </div>
-            
-            <div class="form-group">
-                <label for="disable_stitch">
-                    <input type="checkbox" name="disable_stitch"> Disable Stitch
-                </label>
+                <p><strong>Note:</strong> This uses TikTok's "inbox" upload flow. Your video will be uploaded to your TikTok inbox where you can manually add captions, hashtags, and privacy settings before posting through the TikTok app.</p>
             </div>
             
             <button type="submit">Upload Video</button>
@@ -130,13 +108,15 @@ def get_auth_headers():
     return {"Authorization": f"Bearer {access_token}"}
 
 
-def upload_video_to_tiktok(video_file, title, description="", privacy_level="PUBLIC_TO_EVERYONE", 
+def upload_video_to_tiktok(video_file, title="", description="", privacy_level="PUBLIC_TO_EVERYONE", 
                           disable_duet=False, disable_comment=False, disable_stitch=False):
     """
-    Upload a video to TikTok using the 3-step process:
-    1. Initialize upload
-    2. Upload video content
-    3. Publish video
+    Upload a video to TikTok using the inbox flow (2-step process):
+    1. Initialize upload - gets upload URL
+    2. Upload video content to TikTok servers
+    
+    Note: With the inbox flow, videos are uploaded to the user's TikTok inbox
+    where they can manually add captions and post them through the TikTok app.
     """
     headers = get_auth_headers()
     if not headers:
@@ -148,36 +128,23 @@ def upload_video_to_tiktok(video_file, title, description="", privacy_level="PUB
         video_size = video_file.tell()
         video_file.seek(0)  # Reset to beginning
         
-        # Step 1: Initialize upload
-        print("Step 1: Initializing upload...")
+        # Step 1: Initialize upload (simplified for inbox flow)
+        print("Step 1: Initializing video upload...")
         init_data = {
-            "post_info": {
-                "title": title,
-                "privacy_level": {
-                    "privacy_level_option": privacy_level
-                },
-                "disable_duet": disable_duet,
-                "disable_comment": disable_comment,
-                "disable_stitch": disable_stitch,
-                "brand_content_toggle": False,
-                "brand_organic_toggle": False
-            },
             "source_info": {
                 "source": "FILE_UPLOAD",
                 "video_size": video_size,
-                "chunk_size": video_size,
+                "chunk_size": video_size,  # Single chunk upload
                 "total_chunk_count": 1
             }
         }
         
-        # Add description if provided
-        if description:
-            init_data["post_info"]["text"] = description
-        
         headers_init = get_auth_headers()
         headers_init["Content-Type"] = "application/json; charset=UTF-8"
         
+        print(f"Init request URL: {CONTENT_INIT_URL}")
         print(f"Init request data: {json.dumps(init_data, indent=2)}")
+        print(f"Video size: {video_size} bytes")
         
         init_response = requests.post(
             CONTENT_INIT_URL,
@@ -198,8 +165,9 @@ def upload_video_to_tiktok(video_file, title, description="", privacy_level="PUB
             return {"error": f"Init response not valid JSON: {init_response.text}"}
         
         # Check for errors in response
-        if "error" in init_result:
-            return {"error": f"Init API error: {init_result['error']}"}
+        error_info = init_result.get("error", {})
+        if error_info.get("code") != "ok":
+            return {"error": f"Init API error: {error_info}"}
         
         if "data" not in init_result:
             return {"error": f"Init response missing data: {init_result}"}
@@ -212,17 +180,23 @@ def upload_video_to_tiktok(video_file, title, description="", privacy_level="PUB
             return {"error": f"Init response missing publish_id or upload_url: {init_result}"}
         
         print(f"✅ Init successful. Publish ID: {publish_id}")
+        print(f"Upload URL: {upload_url}")
         
-        # Step 2: Upload video content
+        # Step 2: Upload video content to TikTok servers
         print("Step 2: Uploading video content...")
         video_file.seek(0)  # Reset file pointer
         
-        upload_headers = get_auth_headers()
-        upload_headers["Content-Type"] = "video/mp4"
-        upload_headers["Content-Range"] = f"bytes 0-{video_size-1}/{video_size}"
+        # Prepare upload headers (no Authorization needed for upload URL)
+        upload_headers = {
+            "Content-Type": "video/mp4",
+            "Content-Length": str(video_size),
+            "Content-Range": f"bytes 0-{video_size-1}/{video_size}"
+        }
+        
+        print(f"Upload headers: {upload_headers}")
         
         upload_response = requests.put(
-            upload_url,
+            upload_url,  # Use the full URL as provided by TikTok
             headers=upload_headers,
             data=video_file.read(),
             timeout=120
@@ -231,21 +205,20 @@ def upload_video_to_tiktok(video_file, title, description="", privacy_level="PUB
         print(f"Upload response status: {upload_response.status_code}")
         print(f"Upload response: {upload_response.text}")
         
-        if upload_response.status_code not in [200, 201, 202]:
+        if upload_response.status_code not in [200, 201, 202, 204]:
             return {"error": f"Upload failed (HTTP {upload_response.status_code}): {upload_response.text}"}
         
-        print("✅ Upload successful")
-        
-        # Step 3: Publish video (this step may be automatic with the new API)
-        print("Step 3: Video should be published automatically")
+        print("✅ Upload successful!")
         
         return {
             "success": True,
             "publish_id": publish_id,
-            "message": "Video uploaded successfully! It may take a few minutes to process."
+            "message": "Video uploaded successfully to your TikTok inbox! Check your TikTok app notifications to add captions and post it.",
+            "note": "This uses TikTok's inbox flow - the video will appear in your TikTok inbox where you can manually add captions and publish it."
         }
         
     except Exception as e:
+        print(f"Exception during upload: {str(e)}")
         return {"error": f"Exception during upload: {str(e)}"}
 
 
@@ -363,17 +336,13 @@ def upload():
     video_file = request.files.get("video_file")
     title = request.form.get("title", "").strip()
     description = request.form.get("description", "").strip()
-    privacy_level = request.form.get("privacy_level", "PUBLIC_TO_EVERYONE")
-    disable_duet = bool(request.form.get("disable_duet"))
-    disable_comment = bool(request.form.get("disable_comment"))
-    disable_stitch = bool(request.form.get("disable_stitch"))
+    
+    # Note: Privacy settings and other options are not used in inbox flow
+    # Users will set these manually in the TikTok app
     
     # Validation
     if not video_file or not video_file.filename:
         return "❌ No video file selected", 400
-    
-    if not title:
-        return "❌ Title is required", 400
     
     if not video_file.filename.lower().endswith('.mp4'):
         return "❌ Only MP4 files are supported", 400
@@ -383,9 +352,9 @@ def upload():
     file_size = video_file.tell()
     video_file.seek(0)  # Reset
     
-    # TikTok file size limit is usually around 287MB
-    if file_size > 287 * 1024 * 1024:
-        return "❌ File too large. Maximum size is 287MB", 400
+    # TikTok file size limit
+    if file_size > MAX_FILE_SIZE:
+        return f"❌ File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB", 400
     
     print(f"Starting upload: {video_file.filename} ({file_size} bytes)")
     
@@ -393,20 +362,24 @@ def upload():
     result = upload_video_to_tiktok(
         video_file=video_file,
         title=title,
-        description=description,
-        privacy_level=privacy_level,
-        disable_duet=disable_duet,
-        disable_comment=disable_comment,
-        disable_stitch=disable_stitch
+        description=description
     )
     
     if result.get("error"):
         return f"❌ Upload failed: {result['error']}", 400
     
     return f"""
-    ✅ Video uploaded successfully!<br>
+    ✅ Video uploaded successfully to your TikTok inbox!<br>
     Publish ID: {result.get('publish_id', 'N/A')}<br>
-    Share URL: <a href="{result.get('share_url', '#')}" target="_blank">{result.get('share_url', 'N/A')}</a><br>
+    <br>
+    <strong>Next steps:</strong><br>
+    1. Open your TikTok app<br>
+    2. Check your notifications/inbox<br>
+    3. Find your uploaded video<br>
+    4. Add captions, hashtags, and privacy settings<br>
+    5. Post the video<br>
+    <br>
+    <p><em>{result.get('note', '')}</em></p>
     <br>
     <a href="/upload">Upload Another Video</a> | <a href="/">Home</a>
     """
