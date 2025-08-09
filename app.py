@@ -1,76 +1,298 @@
 import os
 import secrets
-import mimetypes
+import json
+import time
 from urllib.parse import urlencode
-from flask import Flask, request, redirect, session, jsonify, render_template_string
+from flask import Flask, redirect, request, session, jsonify, render_template_string
+
 import requests
 
 app = Flask(__name__)
+
+# ====== ENV ======
+# .env (or Render "Environment") MUST contain these, exactly:
+# TIKTOK_CLIENT_KEY=sbawemm7fb4n0ps8iz           <-- your sandbox client key
+# TIKTOK_CLIENT_SECRET=uF1lxNnTU20eDtoqojsfQe75HA5Jvn4g
+# REDIRECT_URI=https://tiktok-upload.onrender.com/callback
+# FLASK_SECRET_KEY=<any random string>
+
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_" + secrets.token_hex(16))
 
 CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
 CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
+
+# *** This must be IDENTICAL everywhere (portal, authorize, token exchange) ***
 REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
 
-AUTH_URL  = "https://www.tiktok.com/v2/auth/authorize/"
+AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
-SCOPES    = "user.info.basic,video.upload,video.publish"
 
-# Content Posting API endpoints (these names work for both direct & draft)
-INIT_URL     = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
-COMPLETE_URL = "https://open.tiktokapis.com/v2/post/publish/inbox/video/complete/"
-PUBLISH_URL  = "https://open.tiktokapis.com/v2/post/publish/video/"
+# TikTok API endpoints for video upload
+CONTENT_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/content/init/"
+CONTENT_UPLOAD_URL = "https://open.tiktokapis.com/v2/post/publish/content/upload/"
+CONTENT_PUBLISH_URL = "https://open.tiktokapis.com/v2/post/publish/"
 
-# ---------- OAuth helpers ----------
+SCOPES = "user.info.basic,video.upload,video.publish"
+
+# Upload form HTML template
+UPLOAD_FORM_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TikTok Video Upload</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input, textarea, select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+        textarea { height: 100px; resize: vertical; }
+        button { background: #ff0050; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #e6004a; }
+        .error { color: red; margin-top: 10px; }
+        .success { color: green; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h2>Upload Video to TikTok</h2>
+    
+    {% if not session.get('access_token') %}
+        <p>❌ You need to authenticate first: <a href="/login">Login with TikTok</a></p>
+    {% else %}
+        <p>✅ Authenticated as: {{ session.get('open_id', 'Unknown') }}</p>
+        
+        <form method="POST" enctype="multipart/form-data">
+            <div class="form-group">
+                <label for="video_file">Video File (.mp4):</label>
+                <input type="file" name="video_file" accept=".mp4,video/mp4" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="title">Title:</label>
+                <input type="text" name="title" placeholder="Enter video title" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="description">Description:</label>
+                <textarea name="description" placeholder="Enter video description (optional)"></textarea>
+            </div>
+            
+            <div class="form-group">
+                <label for="privacy_level">Privacy Level:</label>
+                <select name="privacy_level">
+                    <option value="SELF_ONLY">Private</option>
+                    <option value="MUTUAL_FOLLOW_FRIENDS">Friends</option>
+                    <option value="PUBLIC_TO_EVERYONE" selected>Public</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="disable_duet">
+                    <input type="checkbox" name="disable_duet"> Disable Duet
+                </label>
+            </div>
+            
+            <div class="form-group">
+                <label for="disable_comment">
+                    <input type="checkbox" name="disable_comment"> Disable Comments
+                </label>
+            </div>
+            
+            <div class="form-group">
+                <label for="disable_stitch">
+                    <input type="checkbox" name="disable_stitch"> Disable Stitch
+                </label>
+            </div>
+            
+            <button type="submit">Upload Video</button>
+        </form>
+        
+        <p><a href="/logout">Logout</a></p>
+    {% endif %}
+    
+    <p><a href="/">← Back to Home</a></p>
+</body>
+</html>
+"""
+
+
+# ---------- helpers ----------
 def new_state():
     s = secrets.token_urlsafe(24)
     session["oauth_state"] = s
     return s
 
+
+def get_auth_headers():
+    """Get authorization headers for API calls"""
+    access_token = session.get("access_token")
+    if not access_token:
+        return None
+    return {"Authorization": f"Bearer {access_token}"}
+
+
+def upload_video_to_tiktok(video_file, title, description="", privacy_level="PUBLIC_TO_EVERYONE", 
+                          disable_duet=False, disable_comment=False, disable_stitch=False):
+    """
+    Upload a video to TikTok using the 3-step process:
+    1. Initialize upload
+    2. Upload video content
+    3. Publish video
+    """
+    headers = get_auth_headers()
+    if not headers:
+        return {"error": "Not authenticated"}
+    
+    try:
+        # Step 1: Initialize upload
+        print("Step 1: Initializing upload...")
+        init_data = {
+            "source_info": {
+                "source": "FILE_UPLOAD",
+                "video_size": len(video_file.read()),
+                "chunk_size": len(video_file.read()),
+                "total_chunk_count": 1
+            }
+        }
+        video_file.seek(0)  # Reset file pointer
+        
+        headers["Content-Type"] = "application/json; charset=UTF-8"
+        init_response = requests.post(
+            CONTENT_INIT_URL,
+            headers=headers,
+            data=json.dumps(init_data),
+            timeout=30
+        )
+        
+        if init_response.status_code != 200:
+            return {"error": f"Init failed: {init_response.text}"}
+        
+        init_result = init_response.json()
+        if init_result.get("error", {}).get("code") != "ok":
+            return {"error": f"Init error: {init_result}"}
+        
+        publish_id = init_result["data"]["publish_id"]
+        upload_url = init_result["data"]["upload_url"]
+        
+        print(f"✅ Init successful. Publish ID: {publish_id}")
+        
+        # Step 2: Upload video content
+        print("Step 2: Uploading video content...")
+        video_file.seek(0)  # Reset file pointer
+        
+        upload_headers = get_auth_headers()
+        upload_headers["Content-Type"] = "video/mp4"
+        
+        upload_response = requests.put(
+            upload_url,
+            headers=upload_headers,
+            data=video_file.read(),
+            timeout=120
+        )
+        
+        if upload_response.status_code not in [200, 201]:
+            return {"error": f"Upload failed: {upload_response.text}"}
+        
+        print("✅ Upload successful")
+        
+        # Step 3: Publish video
+        print("Step 3: Publishing video...")
+        publish_data = {
+            "title": title,
+            "privacy_level": {
+                "privacy_level_option": privacy_level
+            },
+            "disable_duet": disable_duet,
+            "disable_comment": disable_comment,
+            "disable_stitch": disable_stitch,
+            "brand_content_toggle": False,
+            "brand_organic_toggle": False
+        }
+        
+        if description:
+            publish_data["text"] = description
+        
+        publish_headers = get_auth_headers()
+        publish_headers["Content-Type"] = "application/json; charset=UTF-8"
+        
+        publish_response = requests.post(
+            f"{CONTENT_PUBLISH_URL}{publish_id}/",
+            headers=publish_headers,
+            data=json.dumps(publish_data),
+            timeout=30
+        )
+        
+        if publish_response.status_code != 200:
+            return {"error": f"Publish failed: {publish_response.text}"}
+        
+        publish_result = publish_response.json()
+        if publish_result.get("error", {}).get("code") != "ok":
+            return {"error": f"Publish error: {publish_result}"}
+        
+        print("✅ Publish successful")
+        return {
+            "success": True,
+            "publish_id": publish_id,
+            "share_url": publish_result.get("data", {}).get("share_url", ""),
+            "message": "Video uploaded successfully!"
+        }
+        
+    except Exception as e:
+        return {"error": f"Exception during upload: {str(e)}"}
+
+
+# ---------- routes ----------
 @app.route("/")
 def index():
-    return render_template_string("""
-    <h2>TikTok OAuth + Local File Upload</h2>
-    <ol>
-      <li><a href="/login">Login with TikTok</a> → after callback, go to <a href="/form">/form</a></li>
-      <li>Skip OAuth: call <code>/set-token?access_token=act...&open_id=...&expires_in=86400</code>, then open <a href="/form">/form</a></li>
-    </ol>
-    Debug: <a href="/debug-auth">/debug-auth</a> • WhoAmI: <a href="/whoami">/whoami</a> • Health: <a href="/health">/health</a>
-    """)
+    return (
+        "<h3>TikTok OAuth + Video Upload</h3>"
+        '<p><a href="/login">Login with TikTok</a></p>'
+        '<p><a href="/upload">Upload Video</a></p>'
+        '<p><a href="/debug-auth">/debug-auth</a> (shows values the server is using)</p>'
+    )
+
 
 @app.route("/debug-auth")
 def debug_auth():
-    params = {
-        "client_key": CLIENT_KEY,
-        "response_type": "code",
-        "scope": SCOPES,
-        "redirect_uri": REDIRECT_URI,
-        "state": session.get("oauth_state") or new_state(),
-        "force_verify": "1",
-    }
-    return jsonify({
-        "authorize_url": AUTH_URL + "?" + urlencode(params),
+    data = {
         "client_key": CLIENT_KEY,
         "redirect_uri_from_env": REDIRECT_URI,
         "scopes": SCOPES,
         "session_state": session.get("oauth_state"),
-    })
-
-@app.route("/login")
-def login():
-    state = new_state()
+        "authenticated": bool(session.get("access_token")),
+        "open_id": session.get("open_id"),
+    }
+    # Show the exact authorize URL we will send the user to
     params = {
         "client_key": CLIENT_KEY,
         "response_type": "code",
         "scope": SCOPES,
         "redirect_uri": REDIRECT_URI,
-        "state": state,
-        "force_verify": "1",
+        "state": session.get("oauth_state") or "(none yet)",
     }
-    return redirect(AUTH_URL + "?" + urlencode(params), code=302)
+    data["authorize_url"] = AUTH_URL + "?" + urlencode(params)
+    return jsonify(data)
+
+
+@app.route("/login")
+def login():
+    # Always generate a fresh state to avoid reusing codes tied to older redirects
+    state = new_state()
+
+    params = {
+        "client_key": CLIENT_KEY,
+        "response_type": "code",
+        "scope": SCOPES,
+        "redirect_uri": REDIRECT_URI,   # <-- EXACT SAME STRING
+        "state": state,
+        # "force_verify": "1",  # optional: forces TikTok to re-prompt
+    }
+    url = AUTH_URL + "?" + urlencode(params)
+    return redirect(url, code=302)
+
 
 @app.route("/callback")
 def callback():
+    # TikTok returns ?code=...&state=...
     err = request.args.get("error")
     if err:
         return f"❌ TikTok error: {err}", 400
@@ -81,198 +303,117 @@ def callback():
     if not code:
         return "❌ Missing ?code from TikTok.", 400
 
-    if session.get("oauth_state") != state:
+    # Optional: check state
+    saved_state = session.get("oauth_state")
+    if not saved_state or saved_state != state:
         return "❌ State mismatch. Start login again.", 400
 
+    # --- Exchange authorization code for access token ---
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    body = urlencode({
+    payload = {
         "client_key": CLIENT_KEY,
         "client_secret": CLIENT_SECRET,
         "code": code,
         "grant_type": "authorization_code",
+        # *** MUST MATCH *** the value used in /login and the app portal
         "redirect_uri": REDIRECT_URI,
-    })
+    }
+
+    # Use urlencoded body (not JSON)
+    body = urlencode(payload)
     r = requests.post(TOKEN_URL, headers=headers, data=body, timeout=30)
-    j = r.json() if r.headers.get("content-type","").startswith("application/json") else {"raw": r.text}
-    if r.status_code != 200 or "access_token" not in j:
-        return f"❌ Token exchange failed: {j}", 400
 
-    session["access_token"] = j["access_token"]
-    session["open_id"] = j.get("open_id")
-    return f"✅ Got token for open_id={session.get('open_id')}<br><pre>{j}</pre>"
+    try:
+        token_json = r.json()
+    except Exception:
+        token_json = {"raw": r.text}
 
-@app.route("/set-token")
-def set_token():
-    t = request.args.get("access_token")
-    open_id = request.args.get("open_id") or "(unknown)"
-    if not t:
-        return "pass ?access_token=... (&open_id=...)", 400
-    session["access_token"] = t
-    session["open_id"] = open_id
-    session["expires_in"] = request.args.get("expires_in", "3600")
-    return jsonify({"ok": True, "saved_open_id": open_id})
+    if r.status_code != 200 or "access_token" not in token_json:
+        return (
+            "❌ Token response missing access_token: "
+            + jsonify(token_json).get_data(as_text=True),
+            400,
+        )
 
-@app.route("/whoami")
-def whoami():
-    return jsonify({
-        "has_token": bool(session.get("access_token")),
-        "open_id": session.get("open_id"),
-        "expires_in": session.get("expires_in"),
-    })
+    # success
+    session["access_token"] = token_json["access_token"]
+    session["open_id"] = token_json.get("open_id")
+    return redirect("/upload")
 
-# ---------- Upload Form ----------
-FORM_HTML = """
-<!doctype html>
-<title>TikTok uploader (with Draft fallback)</title>
-<h3>Upload and Publish</h3>
-<form action="/upload" method="post" enctype="multipart/form-data">
-  <p>Video (.mp4): <input type="file" name="video" accept="video/mp4" required></p>
-  <p>Caption: <input type="text" name="title" value="Posted via API"></p>
-  <p>Privacy:
-    <select name="privacy">
-      <option value="SELF_ONLY">SELF_ONLY (Sandbox safe)</option>
-      <option value="MUTUAL_FOLLOW_FRIENDS">MUTUAL_FOLLOW_FRIENDS</option>
-      <option value="PUBLIC">PUBLIC</option>
-    </select>
-  </p>
-  <p>Cover timestamp (ms): <input type="number" name="cover_ms" value="0"></p>
-  <button type="submit">Upload & Publish</button>
-</form>
-"""
 
-@app.route("/form")
-def form():
-    if not session.get("access_token"):
-        return 'No token yet. <a href="/login">Login</a> or call /set-token?access_token=...', 401
-    return FORM_HTML
-
-# ---------- Core: INIT (direct), fallback to DRAFT, upload, complete, publish ----------
-def init_direct_or_draft(tok, video_size, file_name, mime_type, caption, privacy, cover_ms):
-    """
-    1) Try DIRECT_POST init
-    2) If 4xx -> try DRAFT init (no post_mode)
-    Returns (upload_url, publish_id, used_mode, raw_json) or (None, None, None, last_json)
-    """
-    headers = {
-        "Authorization": f"Bearer {tok}",
-        "Content-Type": "application/json; charset=utf-8",
-        "Accept": "application/json",
-    }
-    # DIRECT INIT
-    body_direct = {
-        "post_mode": "DIRECT_POST",
-        "post_info": {
-            "caption": caption,             # caption works widely; title also OK for many tenants
-            "privacy_level": privacy,
-            "video_cover_timestamp_ms": cover_ms,
-        },
-        "source_info": {
-            "source": "FILE_UPLOAD",
-            "file_name": file_name,
-            "mime_type": mime_type,
-        },
-        "upload_param": {"video_size": int(video_size)}
-    }
-    r1 = requests.post(INIT_URL, headers=headers, json=body_direct, timeout=60)
-    app.logger.info(f"[INIT direct] status={r1.status_code} text={r1.text[:1200]}")
-    if r1.status_code == 200:
-        j = r1.json()
-        data = j.get("data", j)
-        if data.get("upload_url") and data.get("publish_id"):
-            return data["upload_url"], data["publish_id"], "DIRECT_POST", j
-
-    # DRAFT INIT (fallback)
-    body_draft = {
-        "post_info": {
-            "caption": caption,
-            "privacy_level": privacy,
-            "video_cover_timestamp_ms": cover_ms,
-        },
-        "source_info": {
-            "source": "FILE_UPLOAD",
-            "file_name": file_name,
-            "mime_type": mime_type,
-        },
-        "upload_param": {"video_size": int(video_size)}
-    }
-    r2 = requests.post(INIT_URL, headers=headers, json=body_draft, timeout=60)
-    app.logger.info(f"[INIT draft] status={r2.status_code} text={r2.text[:1200]}")
-    if r2.status_code == 200:
-        j = r2.json()
-        data = j.get("data", j)
-        if data.get("upload_url") and data.get("publish_id"):
-            return data["upload_url"], data["publish_id"], "DRAFT", j
-
-    # All failed
-    last = r2 if r2 is not None else r1
-    last_json = {"status": getattr(last, "status_code", 0), "text": getattr(last, "text", "")}
-    return None, None, None, last_json
-
-def tiktok_complete(tok, publish_id):
-    headers = {
-        "Authorization": f"Bearer {tok}",
-        "Content-Type": "application/json; charset=utf-8",
-        "Accept": "application/json",
-    }
-    body = {"publish_id": publish_id}
-    return requests.post(COMPLETE_URL, headers=headers, json=body, timeout=60)
-
-def tiktok_publish(tok, publish_id):
-    headers = {
-        "Authorization": f"Bearer {tok}",
-        "Content-Type": "application/json; charset=utf-8",
-        "Accept": "application/json",
-    }
-    body = {"publish_id": publish_id}
-    return requests.post(PUBLISH_URL, headers=headers, json=body, timeout=60)
-
-@app.route("/upload", methods=["POST"])
+@app.route("/upload", methods=["GET", "POST"])
 def upload():
+    if request.method == "GET":
+        return render_template_string(UPLOAD_FORM_HTML, session=session)
+    
+    # POST request - handle file upload
     if not session.get("access_token"):
-        return "No access token. Login first.", 401
-
-    tok = session["access_token"]
-    f = request.files.get("video")
-    if not f or not f.filename:
-        return "Please choose a .mp4 file.", 400
-
-    video_bytes = f.read()
-    video_size = len(video_bytes)
-    file_name = f.filename
-    mime_type = mimetypes.guess_type(file_name)[0] or "video/mp4"
-
-    caption = (request.form.get("title") or "").strip() or "Posted via API"
-    privacy = (request.form.get("privacy") or "SELF_ONLY").strip()
-    cover_ms = int(request.form.get("cover_ms") or 0)
-
-    # 1) INIT (direct, then fallback to draft)
-    upload_url, publish_id, mode_used, init_json = init_direct_or_draft(
-        tok, video_size, file_name, mime_type, caption, privacy, cover_ms
+        return "❌ Not authenticated. Please login first.", 401
+    
+    # Get form data
+    video_file = request.files.get("video_file")
+    title = request.form.get("title", "").strip()
+    description = request.form.get("description", "").strip()
+    privacy_level = request.form.get("privacy_level", "PUBLIC_TO_EVERYONE")
+    disable_duet = bool(request.form.get("disable_duet"))
+    disable_comment = bool(request.form.get("disable_comment"))
+    disable_stitch = bool(request.form.get("disable_stitch"))
+    
+    # Validation
+    if not video_file or not video_file.filename:
+        return "❌ No video file selected", 400
+    
+    if not title:
+        return "❌ Title is required", 400
+    
+    if not video_file.filename.lower().endswith('.mp4'):
+        return "❌ Only MP4 files are supported", 400
+    
+    # Check file size (TikTok has limits)
+    video_file.seek(0, 2)  # Seek to end
+    file_size = video_file.tell()
+    video_file.seek(0)  # Reset
+    
+    # TikTok file size limit is usually around 287MB
+    if file_size > 287 * 1024 * 1024:
+        return "❌ File too large. Maximum size is 287MB", 400
+    
+    print(f"Starting upload: {video_file.filename} ({file_size} bytes)")
+    
+    # Upload video
+    result = upload_video_to_tiktok(
+        video_file=video_file,
+        title=title,
+        description=description,
+        privacy_level=privacy_level,
+        disable_duet=disable_duet,
+        disable_comment=disable_comment,
+        disable_stitch=disable_stitch
     )
-    if not upload_url:
-        return jsonify({"status": 400, "step": "init", "response": init_json}), 400
+    
+    if result.get("error"):
+        return f"❌ Upload failed: {result['error']}", 400
+    
+    return f"""
+    ✅ Video uploaded successfully!<br>
+    Publish ID: {result.get('publish_id', 'N/A')}<br>
+    Share URL: <a href="{result.get('share_url', '#')}" target="_blank">{result.get('share_url', 'N/A')}</a><br>
+    <br>
+    <a href="/upload">Upload Another Video</a> | <a href="/">Home</a>
+    """
 
-    # 2) UPLOAD
-    r_up = requests.put(upload_url, data=video_bytes, headers={"Content-Type": mime_type}, timeout=600)
-    if r_up.status_code not in (200, 201, 204):
-        return jsonify({"status": r_up.status_code, "step": "upload", "response": r_up.text}), 400
 
-    # 3) COMPLETE
-    r_comp = tiktok_complete(tok, publish_id)
-    if r_comp.status_code != 200:
-        return jsonify({"status": r_comp.status_code, "step": "complete", "response": r_comp.text}), 400
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
 
-    # 4) PUBLISH (works for both direct & draft)
-    r_pub = tiktok_publish(tok, publish_id)
-    return jsonify({
-        "status": r_pub.status_code,
-        "mode_used": mode_used,          # "DIRECT_POST" or "DRAFT"
-        "publish_response": r_pub.json() if r_pub.headers.get("content-type","").startswith("application/json") else r_pub.text
-    }), (200 if r_pub.status_code == 200 else 400)
 
 @app.route("/health")
 def health():
     return "ok", 200
 
+
 if __name__ == "__main__":
+    # Local dev: python app.py
     app.run(host="0.0.0.0", port=5051, debug=True)
