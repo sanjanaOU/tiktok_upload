@@ -143,35 +143,73 @@ def upload_video_to_tiktok(video_file, title, description="", privacy_level="PUB
         return {"error": "Not authenticated"}
     
     try:
+        # Get file size first
+        video_file.seek(0, 2)  # Seek to end
+        video_size = video_file.tell()
+        video_file.seek(0)  # Reset to beginning
+        
         # Step 1: Initialize upload
         print("Step 1: Initializing upload...")
         init_data = {
+            "post_info": {
+                "title": title,
+                "privacy_level": {
+                    "privacy_level_option": privacy_level
+                },
+                "disable_duet": disable_duet,
+                "disable_comment": disable_comment,
+                "disable_stitch": disable_stitch,
+                "brand_content_toggle": False,
+                "brand_organic_toggle": False
+            },
             "source_info": {
                 "source": "FILE_UPLOAD",
-                "video_size": len(video_file.read()),
-                "chunk_size": len(video_file.read()),
+                "video_size": video_size,
+                "chunk_size": video_size,
                 "total_chunk_count": 1
             }
         }
-        video_file.seek(0)  # Reset file pointer
         
-        headers["Content-Type"] = "application/json; charset=UTF-8"
+        # Add description if provided
+        if description:
+            init_data["post_info"]["text"] = description
+        
+        headers_init = get_auth_headers()
+        headers_init["Content-Type"] = "application/json; charset=UTF-8"
+        
+        print(f"Init request data: {json.dumps(init_data, indent=2)}")
+        
         init_response = requests.post(
             CONTENT_INIT_URL,
-            headers=headers,
+            headers=headers_init,
             data=json.dumps(init_data),
             timeout=30
         )
         
+        print(f"Init response status: {init_response.status_code}")
+        print(f"Init response: {init_response.text}")
+        
         if init_response.status_code != 200:
-            return {"error": f"Init failed: {init_response.text}"}
+            return {"error": f"Init failed (HTTP {init_response.status_code}): {init_response.text}"}
         
-        init_result = init_response.json()
-        if init_result.get("error", {}).get("code") != "ok":
-            return {"error": f"Init error: {init_result}"}
+        try:
+            init_result = init_response.json()
+        except:
+            return {"error": f"Init response not valid JSON: {init_response.text}"}
         
-        publish_id = init_result["data"]["publish_id"]
-        upload_url = init_result["data"]["upload_url"]
+        # Check for errors in response
+        if "error" in init_result:
+            return {"error": f"Init API error: {init_result['error']}"}
+        
+        if "data" not in init_result:
+            return {"error": f"Init response missing data: {init_result}"}
+        
+        data = init_result["data"]
+        publish_id = data.get("publish_id")
+        upload_url = data.get("upload_url")
+        
+        if not publish_id or not upload_url:
+            return {"error": f"Init response missing publish_id or upload_url: {init_result}"}
         
         print(f"✅ Init successful. Publish ID: {publish_id}")
         
@@ -181,6 +219,7 @@ def upload_video_to_tiktok(video_file, title, description="", privacy_level="PUB
         
         upload_headers = get_auth_headers()
         upload_headers["Content-Type"] = "video/mp4"
+        upload_headers["Content-Range"] = f"bytes 0-{video_size-1}/{video_size}"
         
         upload_response = requests.put(
             upload_url,
@@ -189,51 +228,21 @@ def upload_video_to_tiktok(video_file, title, description="", privacy_level="PUB
             timeout=120
         )
         
-        if upload_response.status_code not in [200, 201]:
-            return {"error": f"Upload failed: {upload_response.text}"}
+        print(f"Upload response status: {upload_response.status_code}")
+        print(f"Upload response: {upload_response.text}")
+        
+        if upload_response.status_code not in [200, 201, 202]:
+            return {"error": f"Upload failed (HTTP {upload_response.status_code}): {upload_response.text}"}
         
         print("✅ Upload successful")
         
-        # Step 3: Publish video
-        print("Step 3: Publishing video...")
-        publish_data = {
-            "title": title,
-            "privacy_level": {
-                "privacy_level_option": privacy_level
-            },
-            "disable_duet": disable_duet,
-            "disable_comment": disable_comment,
-            "disable_stitch": disable_stitch,
-            "brand_content_toggle": False,
-            "brand_organic_toggle": False
-        }
+        # Step 3: Publish video (this step may be automatic with the new API)
+        print("Step 3: Video should be published automatically")
         
-        if description:
-            publish_data["text"] = description
-        
-        publish_headers = get_auth_headers()
-        publish_headers["Content-Type"] = "application/json; charset=UTF-8"
-        
-        publish_response = requests.post(
-            f"{CONTENT_PUBLISH_URL}{publish_id}/",
-            headers=publish_headers,
-            data=json.dumps(publish_data),
-            timeout=30
-        )
-        
-        if publish_response.status_code != 200:
-            return {"error": f"Publish failed: {publish_response.text}"}
-        
-        publish_result = publish_response.json()
-        if publish_result.get("error", {}).get("code") != "ok":
-            return {"error": f"Publish error: {publish_result}"}
-        
-        print("✅ Publish successful")
         return {
             "success": True,
             "publish_id": publish_id,
-            "share_url": publish_result.get("data", {}).get("share_url", ""),
-            "message": "Video uploaded successfully!"
+            "message": "Video uploaded successfully! It may take a few minutes to process."
         }
         
     except Exception as e:
