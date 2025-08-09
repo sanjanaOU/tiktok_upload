@@ -27,8 +27,11 @@ REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
 AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 
-# TikTok API endpoints for video upload (Inbox flow - videos go to user's inbox for manual posting)
-CONTENT_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
+# TikTok API endpoints
+# Direct Post API (publishes immediately with metadata)
+CONTENT_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
+# Inbox API (uploads to user's inbox for manual posting) 
+INBOX_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
 
 SCOPES = "user.info.basic,video.upload,video.publish"
 
@@ -68,17 +71,47 @@ UPLOAD_FORM_HTML = """
             </div>
             
             <div class="form-group">
-                <label for="title">Title (Optional for inbox flow):</label>
-                <input type="text" name="title" placeholder="Enter video title (will be added in TikTok app)">
+                <label for="title">Title:</label>
+                <input type="text" name="title" placeholder="Enter video title" required>
             </div>
             
             <div class="form-group">
-                <label for="description">Description (Optional for inbox flow):</label>
-                <textarea name="description" placeholder="Enter video description (will be added in TikTok app)"></textarea>
+                <label for="description">Description:</label>
+                <textarea name="description" placeholder="Enter video description (optional)"></textarea>
             </div>
             
             <div class="form-group">
-                <p><strong>Note:</strong> This uses TikTok's "inbox" upload flow. Your video will be uploaded to your TikTok inbox where you can manually add captions, hashtags, and privacy settings before posting through the TikTok app.</p>
+                <label for="privacy_level">Privacy Level:</label>
+                <select name="privacy_level">
+                    <option value="SELF_ONLY">Private</option>
+                    <option value="MUTUAL_FOLLOW_FRIENDS">Friends</option>
+                    <option value="PUBLIC_TO_EVERYONE" selected>Public</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="disable_duet">
+                    <input type="checkbox" name="disable_duet"> Disable Duet
+                </label>
+            </div>
+            
+            <div class="form-group">
+                <label for="disable_comment">
+                    <input type="checkbox" name="disable_comment"> Disable Comments
+                </label>
+            </div>
+            
+            <div class="form-group">
+                <label for="disable_stitch">
+                    <input type="checkbox" name="disable_stitch"> Disable Stitch
+                </label>
+            </div>
+            
+            <div class="form-group">
+                <label for="direct_post">
+                    <input type="checkbox" name="direct_post" checked> Direct Post (publish immediately)
+                </label>
+                <small>Uncheck to use inbox flow (video goes to your TikTok inbox for manual posting)</small>
             </div>
             
             <button type="submit">Upload Video</button>
@@ -109,14 +142,11 @@ def get_auth_headers():
 
 
 def upload_video_to_tiktok(video_file, title="", description="", privacy_level="PUBLIC_TO_EVERYONE", 
-                          disable_duet=False, disable_comment=False, disable_stitch=False):
+                          disable_duet=False, disable_comment=False, disable_stitch=False, direct_post=True):
     """
-    Upload a video to TikTok using the inbox flow (2-step process):
-    1. Initialize upload - gets upload URL
-    2. Upload video content to TikTok servers
-    
-    Note: With the inbox flow, videos are uploaded to the user's TikTok inbox
-    where they can manually add captions and post them through the TikTok app.
+    Upload a video to TikTok using either:
+    1. Direct Post (publishes immediately with metadata) 
+    2. Inbox flow (uploads to user's inbox for manual posting)
     """
     headers = get_auth_headers()
     if not headers:
@@ -128,26 +158,57 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
         video_size = video_file.tell()
         video_file.seek(0)  # Reset to beginning
         
-        # Step 1: Initialize upload (simplified for inbox flow)
-        print("Step 1: Initializing video upload...")
-        init_data = {
-            "source_info": {
-                "source": "FILE_UPLOAD",
-                "video_size": video_size,
-                "chunk_size": video_size,  # Single chunk upload
-                "total_chunk_count": 1
+        # Choose endpoint based on direct_post parameter
+        init_url = CONTENT_INIT_URL if direct_post else INBOX_INIT_URL
+        
+        # Step 1: Initialize upload
+        print(f"Step 1: Initializing {'direct post' if direct_post else 'inbox'} upload...")
+        
+        if direct_post:
+            # Direct Post API - includes post metadata
+            init_data = {
+                "post_info": {
+                    "title": title or "Uploaded via API",
+                    "privacy_level": {
+                        "privacy_level_option": privacy_level
+                    },
+                    "disable_duet": disable_duet,
+                    "disable_comment": disable_comment,
+                    "disable_stitch": disable_stitch,
+                    "brand_content_toggle": False,
+                    "brand_organic_toggle": False
+                },
+                "source_info": {
+                    "source": "FILE_UPLOAD",
+                    "video_size": video_size,
+                    "chunk_size": video_size,
+                    "total_chunk_count": 1
+                }
             }
-        }
+            
+            # Add description if provided
+            if description:
+                init_data["post_info"]["text"] = description
+        else:
+            # Inbox API - only source info
+            init_data = {
+                "source_info": {
+                    "source": "FILE_UPLOAD",
+                    "video_size": video_size,
+                    "chunk_size": video_size,
+                    "total_chunk_count": 1
+                }
+            }
         
         headers_init = get_auth_headers()
         headers_init["Content-Type"] = "application/json; charset=UTF-8"
         
-        print(f"Init request URL: {CONTENT_INIT_URL}")
+        print(f"Init request URL: {init_url}")
         print(f"Init request data: {json.dumps(init_data, indent=2)}")
         print(f"Video size: {video_size} bytes")
         
         init_response = requests.post(
-            CONTENT_INIT_URL,
+            init_url,
             headers=headers_init,
             data=json.dumps(init_data),
             timeout=30
@@ -157,6 +218,11 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
         print(f"Init response: {init_response.text}")
         
         if init_response.status_code != 200:
+            # If direct post fails, try inbox flow as fallback
+            if direct_post:
+                print("Direct post failed, trying inbox flow...")
+                return upload_video_to_tiktok(video_file, title, description, privacy_level, 
+                                            disable_duet, disable_comment, disable_stitch, False)
             return {"error": f"Init failed (HTTP {init_response.status_code}): {init_response.text}"}
         
         try:
@@ -167,6 +233,11 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
         # Check for errors in response
         error_info = init_result.get("error", {})
         if error_info.get("code") != "ok":
+            # If direct post fails, try inbox flow as fallback
+            if direct_post:
+                print("Direct post failed, trying inbox flow...")
+                return upload_video_to_tiktok(video_file, title, description, privacy_level, 
+                                            disable_duet, disable_comment, disable_stitch, False)
             return {"error": f"Init API error: {error_info}"}
         
         if "data" not in init_result:
@@ -210,12 +281,20 @@ def upload_video_to_tiktok(video_file, title="", description="", privacy_level="
         
         print("✅ Upload successful!")
         
-        return {
-            "success": True,
-            "publish_id": publish_id,
-            "message": "Video uploaded successfully to your TikTok inbox! Check your TikTok app notifications to add captions and post it.",
-            "note": "This uses TikTok's inbox flow - the video will appear in your TikTok inbox where you can manually add captions and publish it."
-        }
+        if direct_post:
+            return {
+                "success": True,
+                "publish_id": publish_id,
+                "message": "Video published directly to TikTok! It may take a few minutes to appear.",
+                "type": "direct_post"
+            }
+        else:
+            return {
+                "success": True,
+                "publish_id": publish_id,
+                "message": "Video uploaded to your TikTok inbox! Check your TikTok app notifications to complete posting.",
+                "type": "inbox_flow"
+            }
         
     except Exception as e:
         print(f"Exception during upload: {str(e)}")
@@ -336,13 +415,18 @@ def upload():
     video_file = request.files.get("video_file")
     title = request.form.get("title", "").strip()
     description = request.form.get("description", "").strip()
-    
-    # Note: Privacy settings and other options are not used in inbox flow
-    # Users will set these manually in the TikTok app
+    privacy_level = request.form.get("privacy_level", "PUBLIC_TO_EVERYONE")
+    disable_duet = bool(request.form.get("disable_duet"))
+    disable_comment = bool(request.form.get("disable_comment"))
+    disable_stitch = bool(request.form.get("disable_stitch"))
+    direct_post = bool(request.form.get("direct_post"))
     
     # Validation
     if not video_file or not video_file.filename:
         return "❌ No video file selected", 400
+    
+    if direct_post and not title:
+        return "❌ Title is required for direct posting", 400
     
     if not video_file.filename.lower().endswith('.mp4'):
         return "❌ Only MP4 files are supported", 400
